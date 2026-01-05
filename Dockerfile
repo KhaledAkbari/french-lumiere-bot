@@ -1,7 +1,7 @@
 
-FROM python:3.13-slim
+FROM python:3.12-slim
 
-# Install ffmpeg (needed for pydub to convert Telegram voice messages)
+# Install ffmpeg (required for pydub to convert Telegram voice messages)
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
