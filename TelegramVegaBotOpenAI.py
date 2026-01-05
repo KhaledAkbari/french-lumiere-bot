@@ -2,32 +2,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-TelegramVegaBotOpenAI.py
-========================
-
-Webhook-based Telegram bot for Render (FastAPI + python-telegram-bot + OpenAI).
-
-Works ONLY inside the Telegram group named exactly:
-    "French Lumière"
-
-Bot reacts ONLY when an admin replies to a message with one of:
-- /reptex  : reply to replied TEXT using OpenAI (French, concise)
-- /repaud  : reply to replied VOICE/AUDIO -> transcribe (Whisper) -> OpenAI (concise)
-- /cortex  : correct replied TEXT (grammar/spelling) + short note
-- /coraud  : transcribe replied VOICE/AUDIO then correct + short note
-
-Environment variables (set in Render):
-- BOT_TOKEN               Telegram bot token
-- OPENAI_API              OpenAI API key
-- RENDER_EXTERNAL_URL      provided by Render Web Service
-- WEBHOOK_SECRET_TOKEN     optional security header
-- OPENAI_MODEL             optional, default "gpt-4o-mini"
-
-Health:
-- GET /healthz -> "healthy"
-"""
-
 import os
 import io
 import html
@@ -45,19 +19,18 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from openai import OpenAI
 from openai import APIError, RateLimitError, APITimeoutError
 
-# Audio conversion (needs ffmpeg installed on the OS)
-from pydub import AudioSegment
+from pydub import AudioSegment  # requires ffmpeg in Docker
 
 
 # -----------------------------
-# Minimal logging (no message content)
+# Minimal logging (no sensitive content)
 # -----------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("FrenchLumiereBot")
-logging.getLogger("httpx").setLevel(logging.WARNING)  # avoid verbose request logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 # -----------------------------
@@ -79,19 +52,19 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API", "").strip()
 
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
-WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip()  # optional override
-WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()  # optional
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip()
+WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
 
 if not BOT_TOKEN:
-    raise RuntimeError("Missing BOT_TOKEN. Add it in Render -> Environment Variables.")
+    raise RuntimeError("BOT_TOKEN manquant. Ajoute-le dans Render → Environment Variables.")
 if not OPENAI_API_KEY:
-    raise RuntimeError("Missing OPENAI_API. Add it in Render -> Environment Variables.")
+    raise RuntimeError("OPENAI_API manquant. Ajoute-le dans Render → Environment Variables.")
 
 BASE_URL = WEBHOOK_BASE_URL or RENDER_EXTERNAL_URL
 if not BASE_URL:
     raise RuntimeError(
-        "Missing public base URL. Render should set RENDER_EXTERNAL_URL automatically. "
-        "If not, set WEBHOOK_BASE_URL=https://your-app.onrender.com"
+        "URL publique manquante. Render doit fournir RENDER_EXTERNAL_URL. "
+        "Sinon, définis WEBHOOK_BASE_URL=https://ton-app.onrender.com"
     )
 
 WEBHOOK_PATH = "/webhook"
@@ -132,25 +105,6 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return member.status in ("administrator", "creator")
 
 
-def mention_admin_html(user) -> str:
-    """Mention admin by @username if available, else clickable mention link."""
-    if not user:
-        return "Admin"
-    if user.username:
-        return f"@{html.escape(user.username)}"
-    safe_name = html.escape(user.first_name or "Admin")
-    return f'<a href="tg://user?id={user.id}">{safe_name}</a>'
-
-
-def sender_ref(user) -> str:
-    """Reference sender by @username or first name (no HTML link needed)."""
-    if not user:
-        return "Utilisateur"
-    if user.username:
-        return f"@{user.username}"
-    return user.first_name or "Utilisateur"
-
-
 def replied_message(update: Update) -> Optional[Message]:
     msg = update.effective_message
     if not msg:
@@ -159,7 +113,6 @@ def replied_message(update: Update) -> Optional[Message]:
 
 
 def audio_file_id(msg: Message) -> Optional[str]:
-    """Get file_id from voice or audio."""
     if msg.voice:
         return msg.voice.file_id
     if msg.audio:
@@ -175,25 +128,13 @@ async def download_file_bytes(context: ContextTypes.DEFAULT_TYPE, file_id: str) 
 
 
 def convert_to_wav(raw_bytes: bytes) -> bytes:
-    """
-    Convert Telegram audio (often ogg/opus) to wav using pydub + ffmpeg.
-    """
     audio = AudioSegment.from_file(io.BytesIO(raw_bytes))
     out = io.BytesIO()
     audio.export(out, format="wav")
     return out.getvalue()
 
 
-def header_block(admin_user, sender_user, sender_id: int, msg_id: int) -> str:
-    return (
-        f"👮 Admin: {mention_admin_html(admin_user)}\n"
-        f"👤 Original sender: {html.escape(sender_ref(sender_user))}\n"
-        f"🧾 Sender ID: <code>{sender_id}</code> | Message ID: <code>{msg_id}</code>\n\n"
-    )
-
-
 async def run_blocking(func, *args):
-    """Run blocking OpenAI calls in a thread so we don't block async loop."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: func(*args))
 
@@ -209,7 +150,7 @@ def openai_chat(text: str) -> str:
         temperature=0.3,
     )
     out = (completion.choices[0].message.content or "").strip()
-    return out or "Désolé, je n’ai pas pu générer de réponse. Pouvez-vous reformuler ?"
+    return out or "Désolé, je n’ai pas pu générer de réponse. Peux-tu reformuler ?"
 
 
 def openai_transcribe(wav_bytes: bytes) -> str:
@@ -225,110 +166,106 @@ def openai_transcribe(wav_bytes: bytes) -> str:
     return getattr(t, "text", "").strip()
 
 
-async def safe_reply(update: Update, text: str):
+def tts_to_ogg_opus_bytes(text_fr: str) -> bytes:
+    """
+    Génère un message vocal (voice) Telegram:
+    1) TTS OpenAI -> MP3 bytes
+    2) Convertit MP3 -> OGG/OPUS via pydub (ffmpeg requis)
+    """
+    # Petite sécurité: éviter des audios trop longs
+    text_fr = (text_fr or "").strip()
+    if len(text_fr) > 900:
+        text_fr = text_fr[:900] + "…"
+
+    # TTS -> mp3 en streaming
+    mp3_bytes = b""
+    with openai_client.audio.speech.with_streaming_response.create(
+        model="tts-1",
+        voice="alloy",
+        input=text_fr,
+        format="mp3",
+    ) as resp:
+        for chunk in resp.iter_bytes():
+            mp3_bytes += chunk
+
+    # mp3 -> ogg/opus
+    audio = AudioSegment.from_file(io.BytesIO(mp3_bytes), format="mp3")
+    out = io.BytesIO()
+    audio.export(out, format="ogg", codec="libopus")
+    return out.getvalue()
+
+
+async def send_french_notice(update: Update, context: ContextTypes.DEFAULT_TYPE, text_fr: str) -> None:
+    """Réponse en français au message de commande (utile pour erreurs)."""
     if update.effective_message:
-        await update.effective_message.reply_text(text)
+        await update.effective_message.reply_text(text_fr)
+
+
+async def reply_to_original_text(update: Update, context: ContextTypes.DEFAULT_TYPE, replied: Message, text_fr: str) -> None:
+    """Répond au message original (pas au message de commande)."""
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=text_fr,
+        reply_to_message_id=replied.message_id,
+        disable_web_page_preview=True,
+    )
+
+
+async def reply_to_original_voice(update: Update, context: ContextTypes.DEFAULT_TYPE, replied: Message, text_fr: str) -> None:
+    """Répond au message original par un message vocal (voice)."""
+    ogg_bytes = await run_blocking(tts_to_ogg_opus_bytes, text_fr)
+    voice_file = io.BytesIO(ogg_bytes)
+    voice_file.name = "reply.ogg"
+
+    await context.bot.send_voice(
+        chat_id=update.effective_chat.id,
+        voice=voice_file,
+        reply_to_message_id=replied.message_id,
+    )
 
 
 # -----------------------------
-# Command handlers (admins only, reply required)
+# Commands
 # -----------------------------
 async def cmd_reptex(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_target_group(update):
         return
+
     if not await is_admin(update, context):
-        await safe_reply(update, "❌ Only group admins can use this command.")
+        await send_french_notice(update, context, "❌ Seuls les administrateurs peuvent utiliser cette commande.")
         return
 
     rep = replied_message(update)
     if not rep or not rep.text:
-        await safe_reply(update, "⚠️ Reply to a TEXT message, then use /reptex.")
+        await send_french_notice(update, context, "⚠️ Réponds à un message texte, puis utilise /reptex.")
         return
-
-    admin_user = update.effective_user
-    sender_user = rep.from_user
-    head = header_block(admin_user, sender_user, sender_user.id if sender_user else 0, rep.message_id)
 
     try:
         answer = await run_blocking(openai_chat, rep.text.strip())
-        await update.effective_message.reply_text(
-            head + html.escape(answer),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+        # Répond au message original
+        await reply_to_original_text(update, context, rep, answer)
         logger.info("Executed /reptex.")
     except (RateLimitError, APITimeoutError):
-        await safe_reply(update, "⚠️ OpenAI is busy or timed out. Please try again.")
+        await send_french_notice(update, context, "⚠️ Le service est surchargé ou a expiré. Réessaie bientôt.")
     except APIError:
-        await safe_reply(update, "⚠️ OpenAI API error. Please try again later.")
+        await send_french_notice(update, context, "⚠️ Erreur OpenAI. Réessaie plus tard.")
     except Exception:
-        logger.exception("Error in /reptex (no user content logged).")
-        await safe_reply(update, "⚠️ Unexpected error. Please try again later.")
-
-
-async def cmd_repaud(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_target_group(update):
-        return
-    if not await is_admin(update, context):
-        await safe_reply(update, "❌ Only group admins can use this command.")
-        return
-
-    rep = replied_message(update)
-    if not rep:
-        await safe_reply(update, "⚠️ Reply to a VOICE/AUDIO message, then use /repaud.")
-        return
-
-    fid = audio_file_id(rep)
-    if not fid:
-        await safe_reply(update, "⚠️ The replied message must be VOICE or AUDIO for /repaud.")
-        return
-
-    admin_user = update.effective_user
-    sender_user = rep.from_user
-    head = header_block(admin_user, sender_user, sender_user.id if sender_user else 0, rep.message_id)
-
-    try:
-        raw = await download_file_bytes(context, fid)
-        wav = convert_to_wav(raw)  # requires ffmpeg
-        transcript = await run_blocking(openai_transcribe, wav)
-
-        if not transcript:
-            await safe_reply(update, "⚠️ Could not transcribe audio. Try again.")
-            return
-
-        answer = await run_blocking(openai_chat, transcript)
-        await update.effective_message.reply_text(
-            head + html.escape(answer),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-        logger.info("Executed /repaud.")
-    except FileNotFoundError:
-        await safe_reply(update, "⚠️ ffmpeg is missing. Use Dockerfile deployment (recommended).")
-    except (RateLimitError, APITimeoutError):
-        await safe_reply(update, "⚠️ OpenAI is busy or timed out. Please try again.")
-    except APIError:
-        await safe_reply(update, "⚠️ OpenAI API error. Please try again later.")
-    except Exception:
-        logger.exception("Error in /repaud (no user content logged).")
-        await safe_reply(update, "⚠️ Unexpected error. Please try again later.")
+        logger.exception("Error in /reptex (no content logged).")
+        await send_french_notice(update, context, "⚠️ Erreur inattendue. Réessaie plus tard.")
 
 
 async def cmd_cortex(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_target_group(update):
         return
+
     if not await is_admin(update, context):
-        await safe_reply(update, "❌ Only group admins can use this command.")
+        await send_french_notice(update, context, "❌ Seuls les administrateurs peuvent utiliser cette commande.")
         return
 
     rep = replied_message(update)
     if not rep or not rep.text:
-        await safe_reply(update, "⚠️ Reply to a TEXT message, then use /cortex.")
+        await send_french_notice(update, context, "⚠️ Réponds à un message texte, puis utilise /cortex.")
         return
-
-    admin_user = update.effective_user
-    sender_user = rep.from_user
-    head = header_block(admin_user, sender_user, sender_user.id if sender_user else 0, rep.message_id)
 
     task = (
         "Corrige la grammaire et l’orthographe du texte ci-dessous. "
@@ -339,41 +276,34 @@ async def cmd_cortex(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         answer = await run_blocking(openai_chat, task)
-        await update.effective_message.reply_text(
-            head + html.escape(answer),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+        await reply_to_original_text(update, context, rep, answer)
         logger.info("Executed /cortex.")
     except (RateLimitError, APITimeoutError):
-        await safe_reply(update, "⚠️ OpenAI is busy or timed out. Please try again.")
+        await send_french_notice(update, context, "⚠️ Le service est surchargé ou a expiré. Réessaie bientôt.")
     except APIError:
-        await safe_reply(update, "⚠️ OpenAI API error. Please try again later.")
+        await send_french_notice(update, context, "⚠️ Erreur OpenAI. Réessaie plus tard.")
     except Exception:
-        logger.exception("Error in /cortex (no user content logged).")
-        await safe_reply(update, "⚠️ Unexpected error. Please try again later.")
+        logger.exception("Error in /cortex (no content logged).")
+        await send_french_notice(update, context, "⚠️ Erreur inattendue. Réessaie plus tard.")
 
 
-async def cmd_coraud(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_repaud(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_target_group(update):
         return
+
     if not await is_admin(update, context):
-        await safe_reply(update, "❌ Only group admins can use this command.")
+        await send_french_notice(update, context, "❌ Seuls les administrateurs peuvent utiliser cette commande.")
         return
 
     rep = replied_message(update)
     if not rep:
-        await safe_reply(update, "⚠️ Reply to a VOICE/AUDIO message, then use /coraud.")
+        await send_french_notice(update, context, "⚠️ Réponds à un message vocal/audio, puis utilise /repaud.")
         return
 
     fid = audio_file_id(rep)
     if not fid:
-        await safe_reply(update, "⚠️ The replied message must be VOICE or AUDIO for /coraud.")
+        await send_french_notice(update, context, "⚠️ Le message visé doit contenir un vocal ou un audio.")
         return
-
-    admin_user = update.effective_user
-    sender_user = rep.from_user
-    head = header_block(admin_user, sender_user, sender_user.id if sender_user else 0, rep.message_id)
 
     try:
         raw = await download_file_bytes(context, fid)
@@ -381,7 +311,48 @@ async def cmd_coraud(update: Update, context: ContextTypes.DEFAULT_TYPE):
         transcript = await run_blocking(openai_transcribe, wav)
 
         if not transcript:
-            await safe_reply(update, "⚠️ Could not transcribe audio. Try again.")
+            await send_french_notice(update, context, "⚠️ Je n’ai pas réussi à transcrire l’audio. Réessaie.")
+            return
+
+        answer = await run_blocking(openai_chat, transcript)
+
+        # IMPORTANT: réponse en AUDIO (voice), pas en texte
+        await reply_to_original_voice(update, context, rep, answer)
+        logger.info("Executed /repaud.")
+    except (RateLimitError, APITimeoutError):
+        await send_french_notice(update, context, "⚠️ Le service est surchargé ou a expiré. Réessaie bientôt.")
+    except APIError:
+        await send_french_notice(update, context, "⚠️ Erreur OpenAI. Réessaie plus tard.")
+    except Exception:
+        logger.exception("Error in /repaud (no content logged).")
+        await send_french_notice(update, context, "⚠️ Erreur inattendue (audio). Réessaie plus tard.")
+
+
+async def cmd_coraud(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_target_group(update):
+        return
+
+    if not await is_admin(update, context):
+        await send_french_notice(update, context, "❌ Seuls les administrateurs peuvent utiliser cette commande.")
+        return
+
+    rep = replied_message(update)
+    if not rep:
+        await send_french_notice(update, context, "⚠️ Réponds à un message vocal/audio, puis utilise /coraud.")
+        return
+
+    fid = audio_file_id(rep)
+    if not fid:
+        await send_french_notice(update, context, "⚠️ Le message visé doit contenir un vocal ou un audio.")
+        return
+
+    try:
+        raw = await download_file_bytes(context, fid)
+        wav = convert_to_wav(raw)
+        transcript = await run_blocking(openai_transcribe, wav)
+
+        if not transcript:
+            await send_french_notice(update, context, "⚠️ Je n’ai pas réussi à transcrire l’audio. Réessaie.")
             return
 
         task = (
@@ -393,21 +364,17 @@ async def cmd_coraud(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         answer = await run_blocking(openai_chat, task)
-        await update.effective_message.reply_text(
-            head + html.escape(answer),
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+
+        # IMPORTANT: réponse en AUDIO (voice)
+        await reply_to_original_voice(update, context, rep, answer)
         logger.info("Executed /coraud.")
-    except FileNotFoundError:
-        await safe_reply(update, "⚠️ ffmpeg is missing. Use Dockerfile deployment (recommended).")
     except (RateLimitError, APITimeoutError):
-        await safe_reply(update, "⚠️ OpenAI is busy or timed out. Please try again.")
+        await send_french_notice(update, context, "⚠️ Le service est surchargé ou a expiré. Réessaie bientôt.")
     except APIError:
-        await safe_reply(update, "⚠️ OpenAI API error. Please try again later.")
+        await send_french_notice(update, context, "⚠️ Erreur OpenAI. Réessaie plus tard.")
     except Exception:
-        logger.exception("Error in /coraud (no user content logged).")
-        await safe_reply(update, "⚠️ Unexpected error. Please try again later.")
+        logger.exception("Error in /coraud (no content logged).")
+        await send_french_notice(update, context, "⚠️ Erreur inattendue (audio). Réessaie plus tard.")
 
 
 # -----------------------------
@@ -428,7 +395,6 @@ async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
 ):
-    # Optional extra security
     if WEBHOOK_SECRET_TOKEN:
         if x_telegram_bot_api_secret_token != WEBHOOK_SECRET_TOKEN:
             raise HTTPException(status_code=403, detail="Forbidden")
@@ -451,21 +417,17 @@ async def telegram_webhook(
     return {"ok": True}
 
 
-# -----------------------------
-# Startup / shutdown
-# -----------------------------
 @app.on_event("startup")
 async def on_startup():
     global telegram_app
-
     logger.info("Starting French Lumière webhook bot...")
     logger.info("Webhook target: %s", WEBHOOK_URL)
 
     telegram_app = Application.builder().token(BOT_TOKEN).build()
 
     telegram_app.add_handler(CommandHandler("reptex", cmd_reptex))
-    telegram_app.add_handler(CommandHandler("repaud", cmd_repaud))
     telegram_app.add_handler(CommandHandler("cortex", cmd_cortex))
+    telegram_app.add_handler(CommandHandler("repaud", cmd_repaud))
     telegram_app.add_handler(CommandHandler("coraud", cmd_coraud))
 
     await telegram_app.initialize()
