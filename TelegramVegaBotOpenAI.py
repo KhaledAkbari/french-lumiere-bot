@@ -3,44 +3,29 @@
 # -*- coding: utf-8 -*-
 
 """
-French Lumière Admin Reply Bot (Render Webhook)
-==============================================
+TelegramVegaBotOpenAI.py
+========================
 
-This FastAPI webhook service is designed for Render Web Service hosting.
-It connects a Telegram bot to OpenAI and works inside a Telegram group named:
+Webhook-based Telegram bot for Render (FastAPI + python-telegram-bot + OpenAI).
 
+Works ONLY inside the Telegram group named exactly:
     "French Lumière"
 
-Behavior:
-- The bot ONLY acts when an ADMIN replies to a message in the group using one of:
-    /reptex  -> Reply to replied TEXT using OpenAI (French, concise)
-    /repaud  -> Reply to replied VOICE/AUDIO:
-               download -> convert (ogg/opus -> wav) -> Whisper -> OpenAI -> concise
-    /cortex  -> Correct replied TEXT (grammar/spelling) + short note about corrections
-    /coraud  -> Transcribe replied VOICE/AUDIO then correct + short note
-
-Security:
-- Verifies the command issuer is an admin of the group before doing anything.
-- Optional: verifies Telegram secret header if WEBHOOK_SECRET_TOKEN is set.
-
-Render endpoints:
-- GET/HEAD /        -> OK
-- GET      /healthz -> healthy (for Render health check)
-- POST     /webhook -> Telegram webhook endpoint
+Bot reacts ONLY when an admin replies to a message with one of:
+- /reptex  : reply to replied TEXT using OpenAI (French, concise)
+- /repaud  : reply to replied VOICE/AUDIO -> transcribe (Whisper) -> OpenAI (concise)
+- /cortex  : correct replied TEXT (grammar/spelling) + short note
+- /coraud  : transcribe replied VOICE/AUDIO then correct + short note
 
 Environment variables (set in Render):
-- BOT_TOKEN              : Telegram bot token
-- OPENAI_API             : OpenAI API key
-- RENDER_EXTERNAL_URL     : set by Render automatically for Web Services
-- WEBHOOK_SECRET_TOKEN    : recommended; verify X-Telegram-Bot-Api-Secret-Token
-- OPENAI_MODEL            : optional, default "gpt-4o-mini"
+- BOT_TOKEN               Telegram bot token
+- OPENAI_API              OpenAI API key
+- RENDER_EXTERNAL_URL      provided by Render Web Service
+- WEBHOOK_SECRET_TOKEN     optional security header
+- OPENAI_MODEL             optional, default "gpt-4o-mini"
 
-Notes about audio:
-- Telegram voice messages are usually OGG/OPUS.
-- OpenAI transcription supports formats like wav/mp3/m4a/webm, not reliably ogg.
-- This code converts to WAV using pydub (requires ffmpeg).
-- On Render, easiest is to deploy with Dockerfile that installs ffmpeg.
-
+Health:
+- GET /healthz -> "healthy"
 """
 
 import os
@@ -55,32 +40,28 @@ from fastapi.responses import PlainTextResponse
 
 from telegram import Update, Message
 from telegram.constants import ChatType, ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 from openai import OpenAI
 from openai import APIError, RateLimitError, APITimeoutError
 
-# Audio conversion
+# Audio conversion (needs ffmpeg installed on the OS)
 from pydub import AudioSegment
 
 
 # -----------------------------
-# Minimal logging (no user content)
+# Minimal logging (no message content)
 # -----------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("FrenchLumiereWebhookBot")
+logger = logging.getLogger("FrenchLumiereBot")
 logging.getLogger("httpx").setLevel(logging.WARNING)  # avoid verbose request logs
 
 
 # -----------------------------
-# Configuration
+# Config
 # -----------------------------
 GROUP_NAME = "French Lumière"
 
@@ -94,9 +75,9 @@ BEHAVIOR_PROMPT = (
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 MAX_OUTPUT_TOKENS = 200
 
-# Env vars
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API", "").strip()
+
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip()  # optional override
 WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()  # optional
@@ -106,12 +87,11 @@ if not BOT_TOKEN:
 if not OPENAI_API_KEY:
     raise RuntimeError("Missing OPENAI_API. Add it in Render -> Environment Variables.")
 
-# Decide public base URL (Render provides RENDER_EXTERNAL_URL)
 BASE_URL = WEBHOOK_BASE_URL or RENDER_EXTERNAL_URL
 if not BASE_URL:
     raise RuntimeError(
-        "Missing public base URL. On Render Web Service, RENDER_EXTERNAL_URL should exist.\n"
-        "If not, set WEBHOOK_BASE_URL manually, e.g. https://your-app.onrender.com"
+        "Missing public base URL. Render should set RENDER_EXTERNAL_URL automatically. "
+        "If not, set WEBHOOK_BASE_URL=https://your-app.onrender.com"
     )
 
 WEBHOOK_PATH = "/webhook"
@@ -132,11 +112,13 @@ telegram_app: Optional[Application] = None
 
 
 # -----------------------------
-# Helper functions
+# Helpers
 # -----------------------------
 def is_target_group(update: Update) -> bool:
     chat = update.effective_chat
-    if not chat or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+    if not chat:
+        return False
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return False
     return (chat.title or "").strip() == GROUP_NAME
 
@@ -150,18 +132,18 @@ async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return member.status in ("administrator", "creator")
 
 
-def admin_mention_html(user) -> str:
-    """Mention admin by username if available, else clickable mention."""
+def mention_admin_html(user) -> str:
+    """Mention admin by @username if available, else clickable mention link."""
     if not user:
         return "Admin"
     if user.username:
         return f"@{html.escape(user.username)}"
-    name = html.escape(user.first_name or "Admin")
-    return f'<a href="tg://user?id={user.id}">{name}</a>'
+    safe_name = html.escape(user.first_name or "Admin")
+    return f'<a href="tg://user?id={user.id}">{safe_name}</a>'
 
 
-def sender_reference(user) -> str:
-    """Reference original sender by @username or first name."""
+def sender_ref(user) -> str:
+    """Reference sender by @username or first name (no HTML link needed)."""
     if not user:
         return "Utilisateur"
     if user.username:
@@ -169,52 +151,54 @@ def sender_reference(user) -> str:
     return user.first_name or "Utilisateur"
 
 
-def get_replied_message(update: Update) -> Optional[Message]:
+def replied_message(update: Update) -> Optional[Message]:
     msg = update.effective_message
     if not msg:
         return None
     return msg.reply_to_message
 
 
-def extract_audio_file_id(replied: Message) -> Optional[str]:
-    """Return file_id for voice or audio message."""
-    if replied.voice:
-        return replied.voice.file_id
-    if replied.audio:
-        return replied.audio.file_id
+def audio_file_id(msg: Message) -> Optional[str]:
+    """Get file_id from voice or audio."""
+    if msg.voice:
+        return msg.voice.file_id
+    if msg.audio:
+        return msg.audio.file_id
     return None
 
 
-async def download_telegram_file_bytes(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> bytes:
+async def download_file_bytes(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> bytes:
     tg_file = await context.bot.get_file(file_id)
     buf = io.BytesIO()
     await tg_file.download_to_memory(out=buf)
     return buf.getvalue()
 
 
-def convert_to_wav_bytes(input_bytes: bytes) -> bytes:
+def convert_to_wav(raw_bytes: bytes) -> bytes:
     """
-    Convert Telegram OGG/OPUS or other audio formats to WAV using pydub.
-    Requires ffmpeg in the runtime (we install it in Dockerfile).
+    Convert Telegram audio (often ogg/opus) to wav using pydub + ffmpeg.
     """
-    audio = AudioSegment.from_file(io.BytesIO(input_bytes))
+    audio = AudioSegment.from_file(io.BytesIO(raw_bytes))
     out = io.BytesIO()
     audio.export(out, format="wav")
     return out.getvalue()
 
 
-def format_header(admin_user, sender_user, sender_id: int, msg_id: int) -> str:
-    admin_tag = admin_mention_html(admin_user)
-    sender_tag = html.escape(sender_reference(sender_user))
+def header_block(admin_user, sender_user, sender_id: int, msg_id: int) -> str:
     return (
-        f"👮 Admin: {admin_tag}\n"
-        f"👤 Original sender: {sender_tag}\n"
+        f"👮 Admin: {mention_admin_html(admin_user)}\n"
+        f"👤 Original sender: {html.escape(sender_ref(sender_user))}\n"
         f"🧾 Sender ID: <code>{sender_id}</code> | Message ID: <code>{msg_id}</code>\n\n"
     )
 
 
+async def run_blocking(func, *args):
+    """Run blocking OpenAI calls in a thread so we don't block async loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: func(*args))
+
+
 def openai_chat(text: str) -> str:
-    """Chat reply in French, concise."""
     completion = openai_client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
@@ -228,193 +212,179 @@ def openai_chat(text: str) -> str:
     return out or "Désolé, je n’ai pas pu générer de réponse. Pouvez-vous reformuler ?"
 
 
-def openai_transcribe_wav(wav_bytes: bytes) -> str:
-    """Transcribe WAV using OpenAI Whisper."""
+def openai_transcribe(wav_bytes: bytes) -> str:
     f = io.BytesIO(wav_bytes)
     f.name = "audio.wav"
-    transcript = openai_client.audio.transcriptions.create(
+    t = openai_client.audio.transcriptions.create(
         model="whisper-1",
         file=f,
         response_format="text",
     )
-    if isinstance(transcript, str):
-        return transcript.strip()
-    return getattr(transcript, "text", "").strip()
+    if isinstance(t, str):
+        return t.strip()
+    return getattr(t, "text", "").strip()
 
 
-async def call_openai_in_thread(func, *args):
-    """Run blocking OpenAI SDK calls in a thread (non-blocking to async loop)."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: func(*args))
-
-
-async def handle_errors(update: Update, message: str):
-    """Send a safe error message."""
+async def safe_reply(update: Update, text: str):
     if update.effective_message:
-        await update.effective_message.reply_text(message)
+        await update.effective_message.reply_text(text)
 
 
 # -----------------------------
-# Command handlers
+# Command handlers (admins only, reply required)
 # -----------------------------
-async def cmd_reptex(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_reptex(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_target_group(update):
         return
-
     if not await is_admin(update, context):
-        await handle_errors(update, "❌ Only group admins can use this command.")
+        await safe_reply(update, "❌ Only group admins can use this command.")
         return
 
-    replied = get_replied_message(update)
-    if not replied or not replied.text:
-        await handle_errors(update, "⚠️ Please reply to a TEXT message when using /reptex.")
+    rep = replied_message(update)
+    if not rep or not rep.text:
+        await safe_reply(update, "⚠️ Reply to a TEXT message, then use /reptex.")
         return
 
     admin_user = update.effective_user
-    sender_user = replied.from_user
-    header = format_header(admin_user, sender_user, sender_user.id if sender_user else 0, replied.message_id)
+    sender_user = rep.from_user
+    head = header_block(admin_user, sender_user, sender_user.id if sender_user else 0, rep.message_id)
 
     try:
-        answer = await call_openai_in_thread(openai_chat, replied.text.strip())
+        answer = await run_blocking(openai_chat, rep.text.strip())
         await update.effective_message.reply_text(
-            header + html.escape(answer),
+            head + html.escape(answer),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
         logger.info("Executed /reptex.")
     except (RateLimitError, APITimeoutError):
-        await handle_errors(update, "⚠️ OpenAI is busy or timed out. Please try again.")
+        await safe_reply(update, "⚠️ OpenAI is busy or timed out. Please try again.")
     except APIError:
-        await handle_errors(update, "⚠️ OpenAI API error. Please try again later.")
+        await safe_reply(update, "⚠️ OpenAI API error. Please try again later.")
     except Exception:
         logger.exception("Error in /reptex (no user content logged).")
-        await handle_errors(update, "⚠️ Unexpected error. Please try again later.")
+        await safe_reply(update, "⚠️ Unexpected error. Please try again later.")
 
 
-async def cmd_repaud(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_repaud(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_target_group(update):
         return
-
     if not await is_admin(update, context):
-        await handle_errors(update, "❌ Only group admins can use this command.")
+        await safe_reply(update, "❌ Only group admins can use this command.")
         return
 
-    replied = get_replied_message(update)
-    if not replied:
-        await handle_errors(update, "⚠️ Please reply to a VOICE/AUDIO message when using /repaud.")
+    rep = replied_message(update)
+    if not rep:
+        await safe_reply(update, "⚠️ Reply to a VOICE/AUDIO message, then use /repaud.")
         return
 
-    file_id = extract_audio_file_id(replied)
-    if not file_id:
-        await handle_errors(update, "⚠️ The replied message must contain VOICE or AUDIO for /repaud.")
+    fid = audio_file_id(rep)
+    if not fid:
+        await safe_reply(update, "⚠️ The replied message must be VOICE or AUDIO for /repaud.")
         return
 
     admin_user = update.effective_user
-    sender_user = replied.from_user
-    header = format_header(admin_user, sender_user, sender_user.id if sender_user else 0, replied.message_id)
+    sender_user = rep.from_user
+    head = header_block(admin_user, sender_user, sender_user.id if sender_user else 0, rep.message_id)
 
     try:
-        raw = await download_telegram_file_bytes(context, file_id)
-        wav = convert_to_wav_bytes(raw)  # requires ffmpeg
-        transcript = await call_openai_in_thread(openai_transcribe_wav, wav)
+        raw = await download_file_bytes(context, fid)
+        wav = convert_to_wav(raw)  # requires ffmpeg
+        transcript = await run_blocking(openai_transcribe, wav)
 
         if not transcript:
-            await handle_errors(update, "⚠️ Could not transcribe the audio. Please try again.")
+            await safe_reply(update, "⚠️ Could not transcribe audio. Try again.")
             return
 
-        # Keep response concise even if audio long (max tokens enforced)
-        answer = await call_openai_in_thread(openai_chat, transcript)
-
+        answer = await run_blocking(openai_chat, transcript)
         await update.effective_message.reply_text(
-            header + html.escape(answer),
+            head + html.escape(answer),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
         logger.info("Executed /repaud.")
     except FileNotFoundError:
-        await handle_errors(update, "⚠️ Audio conversion failed: ffmpeg is missing. Use the provided Dockerfile.")
+        await safe_reply(update, "⚠️ ffmpeg is missing. Use Dockerfile deployment (recommended).")
     except (RateLimitError, APITimeoutError):
-        await handle_errors(update, "⚠️ OpenAI is busy or timed out. Please try again.")
+        await safe_reply(update, "⚠️ OpenAI is busy or timed out. Please try again.")
     except APIError:
-        await handle_errors(update, "⚠️ OpenAI API error. Please try again later.")
+        await safe_reply(update, "⚠️ OpenAI API error. Please try again later.")
     except Exception:
         logger.exception("Error in /repaud (no user content logged).")
-        await handle_errors(update, "⚠️ Unexpected error. Please try again later.")
+        await safe_reply(update, "⚠️ Unexpected error. Please try again later.")
 
 
-async def cmd_cortex(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_cortex(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_target_group(update):
         return
-
     if not await is_admin(update, context):
-        await handle_errors(update, "❌ Only group admins can use this command.")
+        await safe_reply(update, "❌ Only group admins can use this command.")
         return
 
-    replied = get_replied_message(update)
-    if not replied or not replied.text:
-        await handle_errors(update, "⚠️ Please reply to a TEXT message when using /cortex.")
+    rep = replied_message(update)
+    if not rep or not rep.text:
+        await safe_reply(update, "⚠️ Reply to a TEXT message, then use /cortex.")
         return
 
     admin_user = update.effective_user
-    sender_user = replied.from_user
-    header = format_header(admin_user, sender_user, sender_user.id if sender_user else 0, replied.message_id)
+    sender_user = rep.from_user
+    head = header_block(admin_user, sender_user, sender_user.id if sender_user else 0, rep.message_id)
 
-    correction_task = (
+    task = (
         "Corrige la grammaire et l’orthographe du texte ci-dessous. "
         "Retourne d’abord la version corrigée. Ensuite, sur une nouvelle ligne, "
         "ajoute une courte note (très brève) expliquant ce qui a été corrigé.\n\n"
-        f"TEXTE:\n{replied.text.strip()}"
+        f"TEXTE:\n{rep.text.strip()}"
     )
 
     try:
-        answer = await call_openai_in_thread(openai_chat, correction_task)
+        answer = await run_blocking(openai_chat, task)
         await update.effective_message.reply_text(
-            header + html.escape(answer),
+            head + html.escape(answer),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
         logger.info("Executed /cortex.")
     except (RateLimitError, APITimeoutError):
-        await handle_errors(update, "⚠️ OpenAI is busy or timed out. Please try again.")
+        await safe_reply(update, "⚠️ OpenAI is busy or timed out. Please try again.")
     except APIError:
-        await handle_errors(update, "⚠️ OpenAI API error. Please try again later.")
+        await safe_reply(update, "⚠️ OpenAI API error. Please try again later.")
     except Exception:
         logger.exception("Error in /cortex (no user content logged).")
-        await handle_errors(update, "⚠️ Unexpected error. Please try again later.")
+        await safe_reply(update, "⚠️ Unexpected error. Please try again later.")
 
 
-async def cmd_coraud(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_coraud(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_target_group(update):
         return
-
     if not await is_admin(update, context):
-        await handle_errors(update, "❌ Only group admins can use this command.")
+        await safe_reply(update, "❌ Only group admins can use this command.")
         return
 
-    replied = get_replied_message(update)
-    if not replied:
-        await handle_errors(update, "⚠️ Please reply to a VOICE/AUDIO message when using /coraud.")
+    rep = replied_message(update)
+    if not rep:
+        await safe_reply(update, "⚠️ Reply to a VOICE/AUDIO message, then use /coraud.")
         return
 
-    file_id = extract_audio_file_id(replied)
-    if not file_id:
-        await handle_errors(update, "⚠️ The replied message must contain VOICE or AUDIO for /coraud.")
+    fid = audio_file_id(rep)
+    if not fid:
+        await safe_reply(update, "⚠️ The replied message must be VOICE or AUDIO for /coraud.")
         return
 
     admin_user = update.effective_user
-    sender_user = replied.from_user
-    header = format_header(admin_user, sender_user, sender_user.id if sender_user else 0, replied.message_id)
+    sender_user = rep.from_user
+    head = header_block(admin_user, sender_user, sender_user.id if sender_user else 0, rep.message_id)
 
     try:
-        raw = await download_telegram_file_bytes(context, file_id)
-        wav = convert_to_wav_bytes(raw)  # requires ffmpeg
-        transcript = await call_openai_in_thread(openai_transcribe_wav, wav)
+        raw = await download_file_bytes(context, fid)
+        wav = convert_to_wav(raw)
+        transcript = await run_blocking(openai_transcribe, wav)
 
         if not transcript:
-            await handle_errors(update, "⚠️ Could not transcribe the audio. Please try again.")
+            await safe_reply(update, "⚠️ Could not transcribe audio. Try again.")
             return
 
-        correction_task = (
+        task = (
             "Voici une transcription d’un message audio. "
             "Corrige la grammaire et l’orthographe. "
             "Retourne d’abord la version corrigée. Ensuite, sur une nouvelle ligne, "
@@ -422,23 +392,22 @@ async def cmd_coraud(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"TRANSCRIPTION:\n{transcript}"
         )
 
-        answer = await call_openai_in_thread(openai_chat, correction_task)
-
+        answer = await run_blocking(openai_chat, task)
         await update.effective_message.reply_text(
-            header + html.escape(answer),
+            head + html.escape(answer),
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
         logger.info("Executed /coraud.")
     except FileNotFoundError:
-        await handle_errors(update, "⚠️ Audio conversion failed: ffmpeg is missing. Use the provided Dockerfile.")
+        await safe_reply(update, "⚠️ ffmpeg is missing. Use Dockerfile deployment (recommended).")
     except (RateLimitError, APITimeoutError):
-        await handle_errors(update, "⚠️ OpenAI is busy or timed out. Please try again.")
+        await safe_reply(update, "⚠️ OpenAI is busy or timed out. Please try again.")
     except APIError:
-        await handle_errors(update, "⚠️ OpenAI API error. Please try again later.")
+        await safe_reply(update, "⚠️ OpenAI API error. Please try again later.")
     except Exception:
         logger.exception("Error in /coraud (no user content logged).")
-        await handle_errors(update, "⚠️ Unexpected error. Please try again later.")
+        await safe_reply(update, "⚠️ Unexpected error. Please try again later.")
 
 
 # -----------------------------
@@ -459,7 +428,7 @@ async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
 ):
-    # Verify secret token header if enabled
+    # Optional extra security
     if WEBHOOK_SECRET_TOKEN:
         if x_telegram_bot_api_secret_token != WEBHOOK_SECRET_TOKEN:
             raise HTTPException(status_code=403, detail="Forbidden")
@@ -476,14 +445,14 @@ async def telegram_webhook(
         update = Update.de_json(data, telegram_app.bot)
         await telegram_app.process_update(update)
     except Exception:
-        logger.exception("Failed to process update (no user content logged).")
+        logger.exception("Failed to process update (no content logged).")
         raise HTTPException(status_code=500, detail="Failed to process update")
 
     return {"ok": True}
 
 
 # -----------------------------
-# Startup / Shutdown
+# Startup / shutdown
 # -----------------------------
 @app.on_event("startup")
 async def on_startup():
@@ -494,7 +463,6 @@ async def on_startup():
 
     telegram_app = Application.builder().token(BOT_TOKEN).build()
 
-    # Register ONLY admin-triggered commands
     telegram_app.add_handler(CommandHandler("reptex", cmd_reptex))
     telegram_app.add_handler(CommandHandler("repaud", cmd_repaud))
     telegram_app.add_handler(CommandHandler("cortex", cmd_cortex))
@@ -503,13 +471,11 @@ async def on_startup():
     await telegram_app.initialize()
     await telegram_app.start()
 
-    # Set webhook at startup
     await telegram_app.bot.set_webhook(
         url=WEBHOOK_URL,
         secret_token=WEBHOOK_SECRET_TOKEN if WEBHOOK_SECRET_TOKEN else None,
         drop_pending_updates=True,
     )
-
     logger.info("Webhook set successfully.")
 
 
