@@ -70,7 +70,7 @@ ALLOW_ALL_MEMBERS = False
 
 # Si tu veux autoriser certains non-admins, mets leurs IDs ici.
 # Exemple : [1536025556]
-WHITELIST_USER_IDS = [1536025556]
+WHITELIST_USER_IDS = [7455750778, 6864593197]
 
 # Si ALLOW_ALL_MEMBERS = True, tout le monde peut utiliser les commandes.
 # Sinon, si l'utilisateur est dans WHITELIST_USER_IDS, il peut utiliser les commandes.
