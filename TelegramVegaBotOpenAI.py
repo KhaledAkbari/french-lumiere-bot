@@ -788,4 +788,3 @@ async def on_shutdown():
         telegram_app = None
 
     logger.info("Shutdown complete.")
-``
