@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -45,6 +46,9 @@ Variables d’environnement (Render) :
 - RENDER_EXTERNAL_URL (automatique sur Render Web Service)
 - WEBHOOK_SECRET_TOKEN (optionnel mais recommandé)
 - OPENAI_MODEL (optionnel, défaut "gpt-4o-mini")
+- (optionnel) TTS_MODEL (défaut "tts-1")
+- (optionnel) TTS_VOICE (défaut "alloy")
+- (optionnel) TTS_SPEED (défaut "1.0")
 """
 
 import os
@@ -78,6 +82,31 @@ from pydub import AudioSegment  # nécessite ffmpeg dans Docker
 # Mode C: WHITELIST_USER_IDS -> utilisateurs autorisés même s'ils ne sont pas admins
 ALLOW_ALL_MEMBERS = False
 WHITELIST_USER_IDS = [7455750778, 6864593197]  # ex: [7455750778, 6864593197]
+
+
+# =========================================================
+# 🔊 VOIX TTS (facile à configurer)
+# =========================================================
+# Modèles possibles: "tts-1", "tts-1-hd" (latence vs qualité)
+TTS_MODEL = os.getenv("TTS_MODEL", "tts-1").strip()
+
+# Voix supportées pour tts-1 / tts-1-hd :
+# alloy, ash, coral, echo, fable, onyx, nova, sage, shimmer
+TTS_VOICE = os.getenv("TTS_VOICE", "nova").strip()
+
+# Vitesse de lecture (0.25 à 4.0), défaut 1.0
+try:
+    TTS_SPEED = float(os.getenv("TTS_SPEED", "1.0").strip())
+except Exception:
+    TTS_SPEED = 1.0
+
+TTS_1_VOICES = {"alloy", "ash", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer"}
+if TTS_MODEL in ("tts-1", "tts-1-hd") and TTS_VOICE not in TTS_1_VOICES:
+    raise RuntimeError(
+        f"TTS_VOICE invalide pour {TTS_MODEL}. Choisis parmi: {sorted(TTS_1_VOICES)}"
+    )
+if TTS_SPEED < 0.25 or TTS_SPEED > 4.0:
+    raise RuntimeError("TTS_SPEED doit être entre 0.25 et 4.0")
 
 
 # -----------------------------
@@ -352,10 +381,11 @@ def tts_to_ogg_opus_bytes(text_fr: str) -> bytes:
 
     mp3_bytes = b""
     with openai_client.audio.speech.with_streaming_response.create(
-        model="tts-1",
-        voice="alloy",
+        model=TTS_MODEL,
+        voice=TTS_VOICE,
         input=text_fr,
         response_format="mp3",
+        speed=TTS_SPEED,
     ) as resp:
         for chunk in resp.iter_bytes():
             mp3_bytes += chunk
@@ -659,8 +689,6 @@ async def cmd_coraud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await
 async def cmd_preptex(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "preptex")
 async def cmd_prepaud(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "prepaud")
 async def cmd_pcortex(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "pcortex")
-async def cmd_pcoraud(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "pcortex")
-# NOTE: correction ci-dessous : pcoraud
 async def cmd_pcoraud(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "pcoraud")
 
 async def cmd_sumtex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "sumtex")
@@ -760,3 +788,4 @@ async def on_shutdown():
         telegram_app = None
 
     logger.info("Shutdown complete.")
+``
