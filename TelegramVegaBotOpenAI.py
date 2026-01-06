@@ -11,18 +11,35 @@ Bot Telegram (webhook) pour Render (FastAPI + python-telegram-bot + OpenAI).
 Fonctionne UNIQUEMENT dans le groupe Telegram nommé exactement :
     "French Lumière"
 
-Le bot réagit UNIQUEMENT quand un admin répond à un message avec :
-- /reptex  : réponse IA (texte) au message texte ciblé
-- /cortex  : correction (texte) du message texte ciblé + note courte
-- /repaud  : transcription (Whisper) du vocal/audio ciblé -> réponse IA -> réponse en message vocal (audio)
-- /coraud  : transcription (Whisper) du vocal/audio ciblé -> correction IA -> réponse en message vocal (audio)
+Commandes (admin uniquement, en réponse à un message) :
+- /reptex   : analyse (texte + audio si présent) -> réponse en texte
+- /repaud   : analyse (texte + audio si présent) -> réponse en message vocal
+- /cortex   : corrige (texte/audio) -> réponse en texte
+- /coraud   : corrige (texte/audio) -> réponse en message vocal
 
-Règles importantes :
-- Vérifie que l’émetteur de la commande est admin.
-- Répond au message original (pas au message de commande de l’admin).
+Commandes privées (envoie en DM au destinataire original) :
+- /preptex  : version privée de /reptex
+- /prepaud  : version privée de /repaud
+- /pcortex  : version privée de /cortex
+- /pcoraud  : version privée de /coraud
+
+Résumé (cible = utilisateur du message auquel l'admin répond) :
+- /sumtex   : résume les derniers messages de la cible -> texte
+- /sumaud   : résume les derniers messages de la cible -> message vocal
+
+Extraction :
+- /exttex   : extrait le texte d'un audio (audio -> transcription) -> texte
+
+Aide :
+- /aide     : explique les commandes aux admins
+
+Règles :
+- Le bot réagit uniquement aux commandes d'admins et uniquement dans "French Lumière".
+- Répond au message original (pas au message de commande).
 - Toutes les réponses du bot sont en français.
 - Les commandes audio renvoient un message vocal (voice) Telegram en OGG/OPUS.
-- Aucun message “Traitement…” n’est envoyé : uniquement les indicateurs Telegram (typing/recording).
+- Les messages de commande (ceux des admins) sont supprimés après 15 secondes (si permissions).
+- Les commandes privées envoient un DM à l'auteur original (si l'utilisateur a démarré le bot en privé).
 
 Variables d’environnement (Render) :
 - BOT_TOKEN
@@ -34,18 +51,22 @@ Variables d’environnement (Render) :
 
 import os
 import io
+import re
+import uuid
+import time
 import logging
 import asyncio
-import uuid
-import re
-from typing import Optional
+from dataclasses import dataclass
+from collections import deque, defaultdict
+from typing import Optional, Dict, Deque, List, Tuple
 
 from fastapi import FastAPI, Request, Header, HTTPException, Response
 from fastapi.responses import PlainTextResponse
 
 from telegram import Update, Message
 from telegram.constants import ChatType, ChatAction
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.error import Forbidden, BadRequest
 
 from openai import OpenAI
 from openai import APIError, RateLimitError, APITimeoutError
@@ -90,15 +111,8 @@ logger.addFilter(RedactSecretsFilter())
 # -----------------------------
 GROUP_NAME = "French Lumière"
 
-BEHAVIOR_PROMPT = (
-    "Tu es un assistant intégré à un bot Telegram. "
-    "Tu réponds uniquement en français, de manière polie, professionnelle et concise. "
-    "Réponse courte (maximum 200 tokens). "
-    "Aucune métadonnée, aucun en-tête, aucun identifiant."
-)
-
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
-MAX_OUTPUT_TOKENS = 200
+MAX_OUTPUT_TOKENS = 220
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API", "").strip()
@@ -122,12 +136,18 @@ if not BASE_URL:
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
+# Prompt système global (en français, concis)
+BEHAVIOR_PROMPT = (
+    "Tu es un assistant intégré à un bot Telegram. "
+    "Tu réponds uniquement en français, de manière polie, professionnelle et concise. "
+    "Aucune métadonnée, aucun en-tête, aucun identifiant. "
+    "Évite les longues réponses. Si besoin, demande une clarification en une phrase."
+)
 
 # -----------------------------
 # Client OpenAI
 # -----------------------------
 openai_client = OpenAI(api_key=OPENAI_API_KEY, max_retries=0, timeout=30)
-
 
 # -----------------------------
 # FastAPI + Telegram
@@ -137,7 +157,54 @@ telegram_app: Optional[Application] = None
 
 
 # -----------------------------
-# Helpers
+# Mémoire (résumés) : stockage en mémoire des messages vus
+# NB: Réinitialisé si le service redémarre.
+# -----------------------------
+@dataclass
+class StoredMsg:
+    ts: float
+    message_id: int
+    text: str
+    kind: str  # "texte" | "audio"
+    file_id: Optional[str]
+
+
+# key = (chat_id, user_id)
+RECENT: Dict[Tuple[int, int], Deque[StoredMsg]] = defaultdict(lambda: deque(maxlen=25))
+
+
+# -----------------------------
+# Spécifications de commandes (modulaire)
+# -----------------------------
+@dataclass(frozen=True)
+class CommandSpec:
+    mode: str         # "rep" | "cor" | "sum" | "ext" | "help"
+    output: str       # "texte" | "audio"
+    private: bool     # True -> DM à la cible, False -> réponse dans le groupe
+    requires_reply: bool = True
+
+
+COMMANDS: Dict[str, CommandSpec] = {
+    "reptex":  CommandSpec(mode="rep",  output="texte", private=False),
+    "repaud":  CommandSpec(mode="rep",  output="audio", private=False),
+    "cortex":  CommandSpec(mode="cor",  output="texte", private=False),
+    "coraud":  CommandSpec(mode="cor",  output="audio", private=False),
+
+    "preptex": CommandSpec(mode="rep",  output="texte", private=True),
+    "prepaud": CommandSpec(mode="rep",  output="audio", private=True),
+    "pcortex": CommandSpec(mode="cor",  output="texte", private=True),
+    "pcoraud": CommandSpec(mode="cor",  output="audio", private=True),
+
+    "sumtex":  CommandSpec(mode="sum",  output="texte", private=False),
+    "sumaud":  CommandSpec(mode="sum",  output="audio", private=False),
+
+    "exttex":  CommandSpec(mode="ext",  output="texte", private=False),
+    "aide":    CommandSpec(mode="help", output="texte", private=False, requires_reply=False),
+}
+
+
+# -----------------------------
+# Helpers (groupe/admin)
 # -----------------------------
 def is_target_group(update: Update) -> bool:
     chat = update.effective_chat
@@ -198,10 +265,9 @@ async def download_file_bytes(context: ContextTypes.DEFAULT_TYPE, file_id: str) 
 
 def convert_to_wav(raw_bytes: bytes, format_hint: Optional[str] = None) -> bytes:
     """
-    Convertit l’audio Telegram (souvent ogg/opus) ou autre (mp3/m4a) en wav via pydub + ffmpeg.
+    Convertit l’audio (ogg/opus, mp3, m4a, etc.) en wav via pydub + ffmpeg.
     """
     buf = io.BytesIO(raw_bytes)
-    # Donner un nom aide ffmpeg à deviner le format
     if format_hint == "ogg":
         buf.name = "audio.ogg"
     elif format_hint == "mp3":
@@ -225,12 +291,12 @@ async def run_blocking(func, *args):
     return await loop.run_in_executor(None, lambda: func(*args))
 
 
-def openai_chat(text: str) -> str:
+def openai_chat(prompt: str) -> str:
     completion = openai_client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[
             {"role": "system", "content": BEHAVIOR_PROMPT},
-            {"role": "user", "content": text},
+            {"role": "user", "content": prompt},
         ],
         max_tokens=MAX_OUTPUT_TOKENS,
         temperature=0.3,
@@ -262,12 +328,11 @@ def tts_to_ogg_opus_bytes(text_fr: str) -> bytes:
     if not text_fr:
         text_fr = "Désolé, je n’ai pas pu générer de réponse."
 
-    # Éviter un audio trop long (borne simple sur la longueur)
+    # borne simple pour éviter des vocaux trop longs
     if len(text_fr) > 900:
         text_fr = text_fr[:900] + "…"
 
     mp3_bytes = b""
-    # IMPORTANT: response_format (pas "format")
     with openai_client.audio.speech.with_streaming_response.create(
         model="tts-1",
         voice="alloy",
@@ -303,226 +368,399 @@ async def send_notice_fr(update: Update, text_fr: str) -> None:
     Message d'information (erreur) au message de commande de l’admin.
     """
     if update.effective_message:
-        await update.effective_message.reply_text(text_fr)
+        try:
+            await update.effective_message.reply_text(text_fr)
+        except Exception:
+            pass
 
 
-async def reply_to_original_text(update: Update, context: ContextTypes.DEFAULT_TYPE, replied: Message, text_fr: str) -> None:
+async def delete_command_message_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay_s: int = 15):
     """
-    Répond au message original (celui auquel l’admin a répondu).
+    Supprime le message de commande après un délai (si permissions).
     """
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=text_fr,
-        reply_to_message_id=replied.message_id,
-        disable_web_page_preview=True,
-    )
+    await asyncio.sleep(delay_s)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        # Ne pas échouer si absence de permissions
+        return
 
 
-async def reply_to_original_voice(update: Update, context: ContextTypes.DEFAULT_TYPE, replied: Message, text_fr: str) -> None:
+def extract_text_from_message(msg: Message) -> str:
     """
-    Répond au message original avec un message vocal (voice) Telegram.
+    Extrait un texte possible : texte direct ou caption.
     """
+    if msg.text:
+        return msg.text.strip()
+    if msg.caption:
+        return msg.caption.strip()
+    return ""
+
+
+async def build_input_bundle(context: ContextTypes.DEFAULT_TYPE, msg: Message) -> Tuple[str, Optional[str]]:
+    """
+    Retourne (texte, transcription_audio) en analysant le message.
+    - texte : msg.text ou msg.caption
+    - transcription_audio : transcription si voice/audio présent
+    """
+    text = extract_text_from_message(msg)
+    fid = audio_file_id(msg)
+    if not fid:
+        return text, None
+
+    fmt = infer_audio_format_hint(msg)
+    raw = await download_file_bytes(context, fid)
+    wav = await run_blocking(convert_to_wav, raw, fmt)
+    transcript = await run_blocking(openai_transcribe, wav)
+    transcript = (transcript or "").strip()
+    return text, transcript or None
+
+
+def combine_inputs(text: str, transcript: Optional[str]) -> str:
+    """
+    Combine texte et transcription si disponibles.
+    """
+    parts = []
+    if text:
+        parts.append(f"TEXTE:\n{text}")
+    if transcript:
+        parts.append(f"AUDIO (transcription):\n{transcript}")
+    return "\n\n".join(parts).strip()
+
+
+async def send_text_result(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    replied: Message,
+    text_fr: str,
+    private_to_target: bool
+):
+    """
+    Envoie une réponse texte soit :
+    - dans le groupe en réponse au message original
+    - en privé à l'auteur original (si possible)
+    """
+    target_user = replied.from_user
+    if not target_user:
+        await send_notice_fr(update, "⚠️ Impossible d’identifier l’auteur du message ciblé.")
+        return
+
+    if private_to_target:
+        try:
+            await context.bot.send_message(chat_id=target_user.id, text=text_fr, disable_web_page_preview=True)
+        except Forbidden:
+            await send_notice_fr(
+                update,
+                "⚠️ Impossible d’envoyer un message privé à cet utilisateur. "
+                "Il doit d’abord démarrer une conversation avec le bot (en privé)."
+            )
+        except Exception:
+            await send_notice_fr(update, "⚠️ Erreur lors de l’envoi du message privé.")
+    else:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=text_fr,
+            reply_to_message_id=replied.message_id,
+            disable_web_page_preview=True,
+        )
+
+
+async def send_voice_result(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    replied: Message,
+    text_fr: str,
+    private_to_target: bool
+):
+    """
+    Envoie une réponse en message vocal (voice) soit :
+    - dans le groupe en réponse au message original
+    - en privé à l'auteur original (si possible)
+    """
+    target_user = replied.from_user
+    if not target_user:
+        await send_notice_fr(update, "⚠️ Impossible d’identifier l’auteur du message ciblé.")
+        return
+
     ogg_bytes = await run_blocking(tts_to_ogg_opus_bytes, text_fr)
     voice_file = io.BytesIO(ogg_bytes)
     voice_file.name = "reponse.ogg"
     voice_file.seek(0)
 
-    await context.bot.send_voice(
-        chat_id=update.effective_chat.id,
-        voice=voice_file,
-        reply_to_message_id=replied.message_id,
-    )
-
-
-# -----------------------------
-# Commandes
-# -----------------------------
-async def cmd_reptex(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_target_group(update):
-        return
-    if not await is_admin(update, context):
-        await send_notice_fr(update, "❌ Seuls les administrateurs peuvent utiliser cette commande.")
-        return
-
-    rep = get_replied_message(update)
-    if not rep or not rep.text:
-        await send_notice_fr(update, "⚠️ Réponds à un message texte, puis utilise /reptex.")
-        return
-
-    error_id = uuid.uuid4().hex[:8]
-    action_task = None
-
-    try:
-        action_task = asyncio.create_task(chat_action_loop(context, update.effective_chat.id, ChatAction.TYPING))
-
-        answer = await run_blocking(openai_chat, rep.text.strip())
-        await reply_to_original_text(update, context, rep, answer)
-        logger.info("Executed /reptex.")
-    except (RateLimitError, APITimeoutError):
-        await send_notice_fr(update, "⚠️ Le service est surchargé ou a expiré. Réessaie bientôt.")
-    except APIError:
-        await send_notice_fr(update, "⚠️ Erreur OpenAI. Réessaie plus tard.")
-    except Exception:
-        logger.exception("Error in /reptex (id=%s).", error_id)
-        await send_notice_fr(update, f"⚠️ Erreur inattendue. Réessaie plus tard. (code {error_id})")
-    finally:
-        if action_task:
-            action_task.cancel()
-
-
-async def cmd_cortex(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_target_group(update):
-        return
-    if not await is_admin(update, context):
-        await send_notice_fr(update, "❌ Seuls les administrateurs peuvent utiliser cette commande.")
-        return
-
-    rep = get_replied_message(update)
-    if not rep or not rep.text:
-        await send_notice_fr(update, "⚠️ Réponds à un message texte, puis utilise /cortex.")
-        return
-
-    task = (
-        "Corrige la grammaire et l’orthographe du texte ci-dessous. "
-        "Retourne d’abord la version corrigée. Ensuite, sur une nouvelle ligne, "
-        "ajoute une courte note (très brève) expliquant ce qui a été corrigé.\n\n"
-        f"TEXTE:\n{rep.text.strip()}"
-    )
-
-    error_id = uuid.uuid4().hex[:8]
-    action_task = None
-
-    try:
-        action_task = asyncio.create_task(chat_action_loop(context, update.effective_chat.id, ChatAction.TYPING))
-
-        answer = await run_blocking(openai_chat, task)
-        await reply_to_original_text(update, context, rep, answer)
-        logger.info("Executed /cortex.")
-    except (RateLimitError, APITimeoutError):
-        await send_notice_fr(update, "⚠️ Le service est surchargé ou a expiré. Réessaie bientôt.")
-    except APIError:
-        await send_notice_fr(update, "⚠️ Erreur OpenAI. Réessaie plus tard.")
-    except Exception:
-        logger.exception("Error in /cortex (id=%s).", error_id)
-        await send_notice_fr(update, f"⚠️ Erreur inattendue. Réessaie plus tard. (code {error_id})")
-    finally:
-        if action_task:
-            action_task.cancel()
-
-
-async def cmd_repaud(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_target_group(update):
-        return
-    if not await is_admin(update, context):
-        await send_notice_fr(update, "❌ Seuls les administrateurs peuvent utiliser cette commande.")
-        return
-
-    rep = get_replied_message(update)
-    if not rep:
-        await send_notice_fr(update, "⚠️ Réponds à un message vocal/audio, puis utilise /repaud.")
-        return
-
-    fid = audio_file_id(rep)
-    if not fid:
-        await send_notice_fr(update, "⚠️ Le message visé doit contenir un vocal ou un audio.")
-        return
-
-    error_id = uuid.uuid4().hex[:8]
-    action_task = None
-
-    try:
-        # Indicateur “en cours” sans envoyer de texte
-        action_task = asyncio.create_task(chat_action_loop(context, update.effective_chat.id, ChatAction.RECORD_VOICE))
-
-        raw = await download_file_bytes(context, fid)
-
-        # Conversion + transcription dans un thread (fiabilité)
-        fmt = infer_audio_format_hint(rep)
-        wav = await run_blocking(convert_to_wav, raw, fmt)
-        transcript = await run_blocking(openai_transcribe, wav)
-
-        if not transcript:
-            await send_notice_fr(update, "⚠️ Je n’ai pas réussi à transcrire l’audio. Réessaie.")
-            return
-
-        # On peut passer à "typing" pendant la génération
-        if action_task:
-            action_task.cancel()
-        action_task = asyncio.create_task(chat_action_loop(context, update.effective_chat.id, ChatAction.TYPING))
-
-        answer = await run_blocking(openai_chat, transcript)
-        await reply_to_original_voice(update, context, rep, answer)
-        logger.info("Executed /repaud.")
-    except (RateLimitError, APITimeoutError):
-        await send_notice_fr(update, "⚠️ Service surchargé ou expiré. Réessaie dans un instant.")
-    except APIError:
-        await send_notice_fr(update, "⚠️ Erreur OpenAI. Réessaie plus tard.")
-    except Exception:
-        logger.exception("Error in /repaud (id=%s).", error_id)
-        await send_notice_fr(update, f"⚠️ Erreur inattendue (audio). Réessaie plus tard. (code {error_id})")
-    finally:
-        if action_task:
-            action_task.cancel()
-
-
-async def cmd_coraud(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_target_group(update):
-        return
-    if not await is_admin(update, context):
-        await send_notice_fr(update, "❌ Seuls les administrateurs peuvent utiliser cette commande.")
-        return
-
-    rep = get_replied_message(update)
-    if not rep:
-        await send_notice_fr(update, "⚠️ Réponds à un message vocal/audio, puis utilise /coraud.")
-        return
-
-    fid = audio_file_id(rep)
-    if not fid:
-        await send_notice_fr(update, "⚠️ Le message visé doit contenir un vocal ou un audio.")
-        return
-
-    error_id = uuid.uuid4().hex[:8]
-    action_task = None
-
-    try:
-        action_task = asyncio.create_task(chat_action_loop(context, update.effective_chat.id, ChatAction.RECORD_VOICE))
-
-        raw = await download_file_bytes(context, fid)
-
-        fmt = infer_audio_format_hint(rep)
-        wav = await run_blocking(convert_to_wav, raw, fmt)
-        transcript = await run_blocking(openai_transcribe, wav)
-
-        if not transcript:
-            await send_notice_fr(update, "⚠️ Je n’ai pas réussi à transcrire l’audio. Réessaie.")
-            return
-
-        task = (
-            "Voici une transcription d’un message audio. "
-            "Corrige la grammaire et l’orthographe. "
-            "Retourne d’abord la version corrigée. Ensuite, sur une nouvelle ligne, "
-            "ajoute une courte note (très brève) expliquant ce qui a été corrigé.\n\n"
-            f"TRANSCRIPTION:\n{transcript}"
+    if private_to_target:
+        try:
+            await context.bot.send_voice(chat_id=target_user.id, voice=voice_file)
+        except Forbidden:
+            await send_notice_fr(
+                update,
+                "⚠️ Impossible d’envoyer un message privé à cet utilisateur. "
+                "Il doit d’abord démarrer une conversation avec le bot (en privé)."
+            )
+        except Exception:
+            await send_notice_fr(update, "⚠️ Erreur lors de l’envoi du message vocal privé.")
+    else:
+        await context.bot.send_voice(
+            chat_id=update.effective_chat.id,
+            voice=voice_file,
+            reply_to_message_id=replied.message_id,
         )
 
-        if action_task:
-            action_task.cancel()
-        action_task = asyncio.create_task(chat_action_loop(context, update.effective_chat.id, ChatAction.TYPING))
 
-        answer = await run_blocking(openai_chat, task)
-        await reply_to_original_voice(update, context, rep, answer)
-        logger.info("Executed /coraud.")
+# -----------------------------
+# Prompts par mode
+# -----------------------------
+def prompt_rep(combined_input: str) -> str:
+    return (
+        "Tu analyses un message de rap en français. "
+        "Si le contenu est court, répond de façon utile et naturelle, comme une réponse à l'auteur. "
+        "Si c'est un rap, tu peux commenter brièvement le flow, les rimes, la clarté, et proposer 1 amélioration. "
+        "Répond uniquement en français.\n\n"
+        f"{combined_input}"
+    )
+
+
+def prompt_cor(combined_input: str) -> str:
+    return (
+        "Tu corriges la grammaire et l’orthographe du contenu ci-dessous. "
+        "Retourne d’abord la version corrigée. Ensuite, sur une nouvelle ligne, "
+        "ajoute une courte note (très brève) expliquant ce qui a été corrigé.\n\n"
+        f"{combined_input}"
+    )
+
+
+def prompt_sum(items: List[str]) -> str:
+    joined = "\n\n---\n\n".join(items).strip()
+    return (
+        "Tu résumes en français les messages ci-dessous de manière courte et claire (5-8 lignes). "
+        "Ne cite pas de données privées. "
+        "Si des messages sont des transcriptions audio, traite-les comme du texte.\n\n"
+        f"{joined}"
+    )
+
+
+HELP_TEXT_FR = (
+    "📌 *Commandes admin (à utiliser en réponse à un message)*\n\n"
+    "• /reptex : analyse (texte + audio si présent) → réponse en texte\n"
+    "• /repaud : analyse (texte + audio si présent) → réponse en vocal\n"
+    "• /cortex : correction (texte/audio) → texte corrigé + note\n"
+    "• /coraud : correction (texte/audio) → vocal\n\n"
+    "📩 *Versions privées (en DM à l’auteur original)*\n"
+    "• /preptex, /prepaud, /pcortex, /pcoraud\n"
+    "⚠️ L’utilisateur doit d’abord démarrer le bot en privé pour recevoir un DM.\n\n"
+    "🧾 *Résumé (cible = auteur du message auquel tu réponds)*\n"
+    "• /sumtex : résumé en texte\n"
+    "• /sumaud : résumé en vocal\n\n"
+    "🗣️ *Extraction*\n"
+    "• /exttex : audio → transcription texte (nécessite un audio)\n\n"
+    "🧹 Les messages de commande sont supprimés après 15 secondes (si permissions).\n"
+)
+
+
+# -----------------------------
+# Capture des messages (pour /sumtex /sumaud)
+# -----------------------------
+async def capture_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Stocke les messages non-commandes pour permettre les résumés.
+    On ne stocke pas de contenu sensible au-delà du nécessaire (texte/caption + file_id audio).
+    """
+    if not is_target_group(update):
+        return
+
+    msg = update.effective_message
+    if not msg or not msg.from_user:
+        return
+
+    # Ignorer messages de bot
+    if msg.from_user.is_bot:
+        return
+
+    # Ignorer les commandes
+    if msg.text and msg.text.strip().startswith("/"):
+        return
+
+    text = extract_text_from_message(msg)
+    fid = audio_file_id(msg)
+
+    kind = "audio" if fid else "texte"
+    stored = StoredMsg(
+        ts=time.time(),
+        message_id=msg.message_id,
+        text=text,
+        kind=kind,
+        file_id=fid
+    )
+    RECENT[(update.effective_chat.id, msg.from_user.id)].append(stored)
+
+
+# -----------------------------
+# Handler générique de commande
+# -----------------------------
+async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd_name: str):
+    # Restriction groupe
+    if not is_target_group(update):
+        return
+
+    # Admin only
+    if not await is_admin(update, context):
+        await send_notice_fr(update, "❌ Seuls les administrateurs peuvent utiliser cette commande.")
+        return
+
+    spec = COMMANDS.get(cmd_name)
+    if not spec:
+        return
+
+    # Suppression du message de commande après 15s
+    if update.effective_message:
+        asyncio.create_task(
+            delete_command_message_later(context, update.effective_chat.id, update.effective_message.message_id, 15)
+        )
+
+    # /aide ne nécessite pas de reply
+    if spec.mode == "help":
+        await send_notice_fr(update, HELP_TEXT_FR)
+        return
+
+    replied = get_replied_message(update)
+    if spec.requires_reply and not replied:
+        await send_notice_fr(update, "⚠️ Réponds à un message, puis utilise la commande.")
+        return
+
+    # Sécurité : il faut une cible identifiable
+    if not replied or not replied.from_user:
+        await send_notice_fr(update, "⚠️ Impossible d’identifier le message ciblé.")
+        return
+
+    error_id = uuid.uuid4().hex[:8]
+    action_task = None
+
+    try:
+        # Indicateur “en cours”
+        action = ChatAction.RECORD_VOICE if spec.output == "audio" else ChatAction.TYPING
+        action_task = asyncio.create_task(chat_action_loop(context, update.effective_chat.id, action))
+
+        # Mode extraction : nécessite audio
+        if spec.mode == "ext":
+            fid = audio_file_id(replied)
+            if not fid:
+                await send_notice_fr(update, "⚠️ /exttex nécessite un message vocal ou audio.")
+                return
+
+            text, transcript = await build_input_bundle(context, replied)
+            if not transcript:
+                await send_notice_fr(update, "⚠️ Je n’ai pas réussi à transcrire l’audio. Réessaie.")
+                return
+
+            # /exttex : on envoie uniquement la transcription (texte) à la cible (dans le groupe)
+            out_text = transcript.strip()
+            await send_text_result(update, context, replied, out_text, private_to_target=False)
+            logger.info("Executed /exttex.")
+            return
+
+        # Mode résumé : utilise la mémoire locale
+        if spec.mode == "sum":
+            chat_id = update.effective_chat.id
+            target_id = replied.from_user.id
+            history = list(RECENT.get((chat_id, target_id), []))
+
+            if not history:
+                await send_notice_fr(update, "⚠️ Aucun historique disponible pour cet utilisateur (redémarrage récent ?).")
+                return
+
+            # On prend les derniers messages (jusqu'à 10)
+            history = history[-10:]
+
+            # Préparer items (transcrire quelques audios max)
+            items: List[str] = []
+            audio_transcribed = 0
+            for h in history:
+                if h.kind == "texte":
+                    if h.text:
+                        items.append(h.text)
+                else:
+                    # audio : transcrire au besoin (limite pour coût/latence)
+                    if h.file_id and audio_transcribed < 3:
+                        raw = await download_file_bytes(context, h.file_id)
+                        wav = await run_blocking(convert_to_wav, raw, "ogg")
+                        tr = await run_blocking(openai_transcribe, wav)
+                        tr = (tr or "").strip()
+                        if tr:
+                            items.append(f"(transcription audio) {tr}")
+                        audio_transcribed += 1
+
+            if not items:
+                await send_notice_fr(update, "⚠️ Rien à résumer (messages vides ou non traitables).")
+                return
+
+            prompt = prompt_sum(items)
+            result = await run_blocking(openai_chat, prompt)
+
+            if spec.output == "audio":
+                await send_voice_result(update, context, replied, result, private_to_target=spec.private)
+            else:
+                await send_text_result(update, context, replied, result, private_to_target=spec.private)
+
+            logger.info("Executed /%s.", cmd_name)
+            return
+
+        # Modes rep/cor : analyser texte + audio si présents
+        text, transcript = await build_input_bundle(context, replied)
+        combined = combine_inputs(text, transcript)
+
+        if not combined:
+            await send_notice_fr(update, "⚠️ Le message ciblé ne contient ni texte ni audio exploitable.")
+            return
+
+        if spec.mode == "rep":
+            prompt = prompt_rep(combined)
+        elif spec.mode == "cor":
+            prompt = prompt_cor(combined)
+        else:
+            await send_notice_fr(update, "⚠️ Mode de commande inconnu.")
+            return
+
+        result = await run_blocking(openai_chat, prompt)
+
+        # Envoyer résultat selon format + privé/public
+        if spec.output == "audio":
+            await send_voice_result(update, context, replied, result, private_to_target=spec.private)
+        else:
+            await send_text_result(update, context, replied, result, private_to_target=spec.private)
+
+        logger.info("Executed /%s.", cmd_name)
+
     except (RateLimitError, APITimeoutError):
         await send_notice_fr(update, "⚠️ Service surchargé ou expiré. Réessaie dans un instant.")
+        logger.warning("OpenAI timeout/ratelimit in /%s (id=%s).", cmd_name, error_id)
     except APIError:
         await send_notice_fr(update, "⚠️ Erreur OpenAI. Réessaie plus tard.")
+        logger.warning("OpenAI APIError in /%s (id=%s).", cmd_name, error_id)
     except Exception:
-        logger.exception("Error in /coraud (id=%s).", error_id)
-        await send_notice_fr(update, f"⚠️ Erreur inattendue (audio). Réessaie plus tard. (code {error_id})")
+        logger.exception("Erreur inattendue dans /%s (id=%s).", cmd_name, error_id)
+        await send_notice_fr(update, f"⚠️ Erreur inattendue. Réessaie plus tard. (code {error_id})")
     finally:
         if action_task:
             action_task.cancel()
+
+
+# -----------------------------
+# Wrappers par commande (PTB exige une fonction par handler)
+# -----------------------------
+async def cmd_reptex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "reptex")
+async def cmd_repaud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "repaud")
+async def cmd_cortex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "cortex")
+async def cmd_coraud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "coraud")
+
+async def cmd_preptex(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "preptex")
+async def cmd_prepaud(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "prepaud")
+async def cmd_pcortex(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "pcortex")
+async def cmd_pcoraud(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "pcoraud")
+
+async def cmd_sumtex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "sumtex")
+async def cmd_sumaud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "sumaud")
+
+async def cmd_exttex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "exttex")
+async def cmd_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "aide")
 
 
 # -----------------------------
@@ -575,14 +813,30 @@ async def on_startup():
 
     telegram_app = Application.builder().token(BOT_TOKEN).build()
 
+    # Capture messages (pour résumé)
+    telegram_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, capture_message))
+
+    # Command handlers
     telegram_app.add_handler(CommandHandler("reptex", cmd_reptex))
-    telegram_app.add_handler(CommandHandler("cortex", cmd_cortex))
     telegram_app.add_handler(CommandHandler("repaud", cmd_repaud))
+    telegram_app.add_handler(CommandHandler("cortex", cmd_cortex))
     telegram_app.add_handler(CommandHandler("coraud", cmd_coraud))
+
+    telegram_app.add_handler(CommandHandler("preptex", cmd_preptex))
+    telegram_app.add_handler(CommandHandler("prepaud", cmd_prepaud))
+    telegram_app.add_handler(CommandHandler("pcortex", cmd_pcortex))
+    telegram_app.add_handler(CommandHandler("pcoraud", cmd_pcoraud))
+
+    telegram_app.add_handler(CommandHandler("sumtex", cmd_sumtex))
+    telegram_app.add_handler(CommandHandler("sumaud", cmd_sumaud))
+
+    telegram_app.add_handler(CommandHandler("exttex", cmd_exttex))
+    telegram_app.add_handler(CommandHandler("aide", cmd_aide))
 
     await telegram_app.initialize()
     await telegram_app.start()
 
+    # Ne pas logger l'URL complète pour éviter toute fuite accidentelle
     await telegram_app.bot.set_webhook(
         url=WEBHOOK_URL,
         secret_token=WEBHOOK_SECRET_TOKEN if WEBHOOK_SECRET_TOKEN else None,
