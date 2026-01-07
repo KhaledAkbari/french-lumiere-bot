@@ -86,7 +86,7 @@ from pydub import AudioSegment  # nécessite ffmpeg dans Docker
 # Mode B: ALLOW_ALL_MEMBERS=True -> tout le monde peut utiliser les commandes
 # Mode C: WHITELIST_USER_IDS -> utilisateurs autorisés même s'ils ne sont pas admins
 ALLOW_ALL_MEMBERS = False
-WHITELIST_USER_IDS = [7455750778, 6864593197]  # ex: [7455750778, 6864593197]
+WHITELIST_USER_IDS = [74557507780]  # ex: [7455750778, 6864593197]
 
 
 # =========================================================
@@ -107,9 +107,7 @@ except Exception:
 
 TTS_1_VOICES = {"alloy", "ash", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer"}
 if TTS_MODEL in ("tts-1", "tts-1-hd") and TTS_VOICE not in TTS_1_VOICES:
-    raise RuntimeError(
-        f"TTS_VOICE invalide pour {TTS_MODEL}. Choisis parmi: {sorted(TTS_1_VOICES)}"
-    )
+    raise RuntimeError(f"TTS_VOICE invalide pour {TTS_MODEL}. Choisis parmi: {sorted(TTS_1_VOICES)}")
 if TTS_SPEED < 0.25 or TTS_SPEED > 4.0:
     raise RuntimeError("TTS_SPEED doit être entre 0.25 et 4.0")
 
@@ -502,7 +500,7 @@ def combine_inputs(text: str, transcript: Optional[str]) -> str:
 def _is_identity_question(text: str) -> bool:
     """
     Détecte si quelqu’un demande l’identité d’Alya (sans commande).
-    Déclencheurs volontairement simples et robustes.
+    Déclencheurs simples et robustes.
     """
     t = (text or "").strip().lower()
 
@@ -510,10 +508,9 @@ def _is_identity_question(text: str) -> bool:
         "qui es-tu", "qui es tu", "t'es qui", "tes qui",
         "c’est qui", "c'est qui", "qui est alya", "qui es-tu alya", "qui es tu alya",
         "présente-toi", "presente-toi", "présente toi", "presente toi",
-        "tu es qui", "tu es qui ?",
-        "c'est toi alya", "c’est toi alya",
-        "comment tu t'appelles", "comment tu t’appelles",
+        "tu es qui", "comment tu t'appelles", "comment tu t’appelles",
         "ton nom", "quel est ton nom",
+        "c'est toi alya", "c’est toi alya",
     )
 
     return any(k in t for k in triggers)
@@ -661,7 +658,7 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
         await send_notice_fr(update, HELP_TEXT_FR)
         return
 
-    # /alya ne nécessite pas d'être admin, ni de reply
+    # /alya (identité) ne nécessite pas d’être admin, ni de reply
     if spec.mode == "who":
         await send_notice_fr(update, BOT_IDENTITY_FR)
         return
@@ -839,9 +836,7 @@ async def on_startup():
 
     telegram_app.add_handler(CommandHandler("exttex", cmd_exttex))
     telegram_app.add_handler(CommandHandler("aide", cmd_aide))
-    telegram_app.add_handler(CommandHandler("alya", cmd_alya))
-
-    await telegram_app.initialize()
+    telegram_app.add_handler(CommandHandler("alya",nitialize()
     await telegram_app.start()
 
     await telegram_app.bot.set_webhook(
@@ -850,7 +845,7 @@ async def on_startup():
         drop_pending_updates=True,
     )
 
-   y.")
+    logger.info("Webhook set successfully.")
 
 
 @app.on_event("shutdown")
