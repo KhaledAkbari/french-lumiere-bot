@@ -8,8 +8,9 @@ TelegramVegaBotOpenAI.py
 
 Bot Telegram (webhook) pour Render (FastAPI + python-telegram-bot + OpenAI).
 
-Fonctionne UNIQUEMENT dans le groupe Telegram nommé exactement :
-    "French Lumière"
+Fonctionne UNIQUEMENT dans les groupes Telegram nommés exactement :
+    - "French Lumière"
+    - "Les Lumières du Français"
 
 Commandes (en réponse à un message) :
 - /reptex   : analyse (texte + audio si présent) -> réponse en texte
@@ -33,12 +34,16 @@ Extraction :
 Aide :
 - /aide     : explique les commandes
 
+Identité :
+- /alya     : qui suis-je ? (identité du bot)
+
 Règles :
-- Le bot réagit uniquement dans "French Lumière".
+- Le bot réagit uniquement dans les groupes autorisés.
 - Toutes les réponses du bot sont en français.
 - Les commandes audio renvoient un message vocal (voice) Telegram en OGG/OPUS.
 - Les messages de commande (ceux des admins/utilisateurs autorisés) sont supprimés après 15 secondes (si permissions).
 - Les commandes privées envoient un DM à l'auteur original (si l'utilisateur a démarré le bot en privé).
+- Alya répond aussi automatiquement (sans commande) si quelqu’un lui demande qui elle est.
 
 Variables d’environnement (Render) :
 - BOT_TOKEN
@@ -65,7 +70,7 @@ from fastapi.responses import PlainTextResponse
 
 from telegram import Update, Message
 from telegram.constants import ChatType, ChatAction
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.error import Forbidden
 
 from openai import OpenAI
@@ -142,9 +147,23 @@ logger.addFilter(RedactSecretsFilter())
 
 
 # -----------------------------
-# Configuration
+# Configuration (groupes + identité)
 # -----------------------------
-GROUP_NAME = "French Lumière"
+# Groupes autorisés (titre exact Telegram, accents inclus)
+GROUP_NAMES = {
+    "French Lumière",
+    "Les Lumières du Français",
+}
+
+# Identité du bot
+BOT_NAME = "Alya"
+BOT_IDENTITY_FR = (
+    "✨ Je m’appelle Alya.\n"
+    "Mon nom évoque une lumière élevée : je suis là pour aider à améliorer ton français.\n\n"
+    "Je peux analyser et corriger des messages (texte ou audio), résumer un message ciblé, "
+    "et transcrire un audio.\n"
+    "Dans ce groupe, j’interviens surtout via les commandes (ex: /reptex, /repaud, /cortex, /coraud, /sumtex, /sumaud, /exttex)."
+)
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 MAX_OUTPUT_TOKENS = 220
@@ -171,9 +190,11 @@ if not BASE_URL:
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
-# Prompt système global (en français, concis)
+# Prompt système global (en français, concis) — avec identité Alya
 BEHAVIOR_PROMPT = (
-    "Tu es un assistant intégré à un bot Telegram. "
+    f"Tu es {BOT_NAME}, une assistante intégrée à un bot Telegram. "
+    "Ton nom évoque une lumière élevée. "
+    "Si on te demande qui tu es, réponds brièvement que tu t’appelles Alya et que tu aides à améliorer le français. "
     "Tu réponds uniquement en français, de manière polie, professionnelle et concise. "
     "Aucune métadonnée, aucun en-tête, aucun identifiant. "
     "Évite les longues réponses. Si besoin, demande une clarification en une phrase."
@@ -196,7 +217,7 @@ telegram_app: Optional[Application] = None
 # -----------------------------
 @dataclass(frozen=True)
 class CommandSpec:
-    mode: str         # "rep" | "cor" | "sum" | "ext" | "help"
+    mode: str         # "rep" | "cor" | "sum" | "ext" | "help" | "who"
     output: str       # "texte" | "audio"
     private: bool     # True -> DM à la cible, False -> réponse dans le groupe
     requires_reply: bool = True
@@ -218,6 +239,7 @@ COMMANDS: Dict[str, CommandSpec] = {
 
     "exttex":  CommandSpec(mode="ext",  output="texte", private=False),
     "aide":    CommandSpec(mode="help", output="texte", private=False, requires_reply=False),
+    "alya":    CommandSpec(mode="who",  output="texte", private=False, requires_reply=False),
 }
 
 
@@ -229,7 +251,8 @@ HELP_TEXT_FR = (
     "• /coraud : correction (texte + audio si présent) → vocal\n"
     "• /sumtex : résumé du message ciblé (texte/audio) → texte\n"
     "• /sumaud : résumé du message ciblé (texte/audio) → vocal\n"
-    "• /exttex : audio → transcription texte (nécessite un audio)\n\n"
+    "• /exttex : audio → transcription texte (nécessite un audio)\n"
+    "• /alya : qui suis-je ? (identité du bot)\n\n"
     "📩 *Versions privées (en DM à l’auteur original)*\n"
     "• /preptex, /prepaud, /pcortex, /pcoraud\n"
     "⚠️ L’utilisateur doit d’abord démarrer le bot en privé pour recevoir un DM.\n\n"
@@ -246,7 +269,7 @@ def is_target_group(update: Update) -> bool:
         return False
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return False
-    return (chat.title or "").strip() == GROUP_NAME
+    return (chat.title or "").strip() in GROUP_NAMES
 
 
 async def user_can_use_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -476,6 +499,49 @@ def combine_inputs(text: str, transcript: Optional[str]) -> str:
     return "\n\n".join(parts).strip()
 
 
+def _is_identity_question(text: str) -> bool:
+    """
+    Détecte si quelqu’un demande l’identité d’Alya (sans commande).
+    Déclencheurs volontairement simples et robustes.
+    """
+    t = (text or "").strip().lower()
+
+    triggers = (
+        "qui es-tu", "qui es tu", "t'es qui", "tes qui",
+        "c’est qui", "c'est qui", "qui est alya", "qui es-tu alya", "qui es tu alya",
+        "présente-toi", "presente-toi", "présente toi", "presente toi",
+        "tu es qui", "tu es qui ?",
+        "c'est toi alya", "c’est toi alya",
+        "comment tu t'appelles", "comment tu t’appelles",
+        "ton nom", "quel est ton nom",
+    )
+
+    return any(k in t for k in triggers)
+
+
+async def handle_identity_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Réponse automatique si quelqu’un demande : "qui es-tu ?" / "c’est qui Alya ?" etc.
+    Ne nécessite pas d’être admin.
+    """
+    if not is_target_group(update):
+        return
+
+    user = update.effective_user
+    if user and user.is_bot:
+        return
+
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+
+    if _is_identity_question(msg.text):
+        try:
+            await msg.reply_text(BOT_IDENTITY_FR)
+        except Exception:
+            pass
+
+
 async def send_text_result(update: Update, context: ContextTypes.DEFAULT_TYPE, replied: Message, text_fr: str, private_to_target: bool):
     """
     Envoie une réponse texte soit :
@@ -580,11 +646,6 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
     if not is_target_group(update):
         return
 
-    # Contrôle d'accès (admin/créateur par défaut, ou toggle/whitelist)
-    if not await user_can_use_commands(update, context):
-        await send_notice_fr(update, "❌ Tu n’as pas l’autorisation d’utiliser cette commande.")
-        return
-
     spec = COMMANDS.get(cmd_name)
     if not spec:
         return
@@ -598,6 +659,16 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
     # /aide ne nécessite pas de reply
     if spec.mode == "help":
         await send_notice_fr(update, HELP_TEXT_FR)
+        return
+
+    # /alya ne nécessite pas d'être admin, ni de reply
+    if spec.mode == "who":
+        await send_notice_fr(update, BOT_IDENTITY_FR)
+        return
+
+    # Contrôle d'accès (admin/créateur par défaut, ou toggle/whitelist)
+    if not await user_can_use_commands(update, context):
+        await send_notice_fr(update, "❌ Tu n’as pas l’autorisation d’utiliser cette commande.")
         return
 
     replied = get_replied_message(update)
@@ -696,6 +767,7 @@ async def cmd_sumaud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await
 
 async def cmd_exttex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "exttex")
 async def cmd_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "aide")
+async def cmd_alya(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "alya")
 
 
 # -----------------------------
@@ -744,9 +816,12 @@ async def telegram_webhook(
 @app.on_event("startup")
 async def on_startup():
     global telegram_app
-    logger.info("Starting French Lumière webhook bot...")
+    logger.info("Starting %s webhook bot...", BOT_NAME)
 
     telegram_app = Application.builder().token(BOT_TOKEN).build()
+
+    # Réponses automatiques (sans commande) : identité Alya
+    telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_identity_questions))
 
     # Command handlers
     telegram_app.add_handler(CommandHandler("reptex", cmd_reptex))
@@ -764,6 +839,7 @@ async def on_startup():
 
     telegram_app.add_handler(CommandHandler("exttex", cmd_exttex))
     telegram_app.add_handler(CommandHandler("aide", cmd_aide))
+    telegram_app.add_handler(CommandHandler("alya", cmd_alya))
 
     await telegram_app.initialize()
     await telegram_app.start()
@@ -774,7 +850,7 @@ async def on_startup():
         drop_pending_updates=True,
     )
 
-    logger.info("Webhook set successfully.")
+   y.")
 
 
 @app.on_event("shutdown")
