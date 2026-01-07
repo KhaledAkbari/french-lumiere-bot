@@ -10,6 +10,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY TelegramVegaBotOpenAI.py .
+# Copy the correct python file
+COPY TelegramAlyaBotOpenAI.py .
 
-CMD ["sh", "-c", "uvicorn TelegramVegaBotOpenAI:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["sh", "-c", "uvicorn TelegramAlyaBotOpenAI:app --host 0.0.0.0 --port ${PORT}"]
