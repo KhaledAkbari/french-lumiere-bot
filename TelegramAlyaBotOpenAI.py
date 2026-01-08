@@ -284,19 +284,22 @@ COMMANDS: Dict[str, CommandSpec] = {
 
 # /aide WITHOUT cooldown/audio limit lines (as requested)
 HELP_TEXT_FR = (
-    "📌 Commandes (à utiliser en réponse à un message)\n\n"
-    "• /reptex  : répondre naturellement (sans corriger) → texte\n"
-    "• /repaud  : répondre naturellement (sans corriger) → vocal\n"
-    "• /cortex  : correction douce + feedback positif → texte\n"
-    "• /coraud  : correction douce + feedback positif → vocal\n"
-    "• /reftex  : reformuler (plus fluide) + 2–3 mots utiles → texte\n"
-    "• /refaud  : reformuler (plus fluide) + 2–3 mots utiles → vocal\n"
-    "• /sumtex  : résumé → texte\n"
-    "• /sumaud  : résumé → vocal\n"
-    "• /exttex  : audio → transcription texte\n"
-    "• /alya    : identité\n"
+    "📌 *Commandes (à utiliser en réponse à un message)*\n\n"
+    "• /reptex : répondre naturellement (texte + audio si présent) → *texte*\n"
+    "• /repaud : répondre naturellement (texte + audio si présent) → *vocal*\n"
+    "• /cortex : corriger avec bienveillance (texte + audio si présent) → *texte + feedback*\n"
+    "• /coraud : corriger avec bienveillance (texte + audio si présent) → *vocal*\n"
+    "• /reftex : reformuler en version plus fluide (texte + audio si présent) → *texte + 2–3 mots utiles*\n"
+    "• /refaud : reformuler en version plus fluide (texte + audio si présent) → *vocal + 2–3 mots utiles*\n"
+    "• /sumtex : résumer le message ciblé (texte/audio) → *texte*\n"
+    "• /sumaud : résumer le message ciblé (texte/audio) → *vocal*\n"
+    "• /exttex : audio → *transcription texte* (nécessite un audio)\n"
+    "• /alya : qui suis-je ? (identité du bot)\n\n"
+    "📩 *Versions privées (en DM à l’auteur original)*\n"
+    "• /preptex, /prepaud, /pcortex, /pcoraud\n"
+    "⚠️ L’utilisateur doit d’abord démarrer le bot en privé pour recevoir un DM.\n\n"
+    "🧹 Les messages de commande sont supprimés automatiquement (si permissions).\n"
 )
-
 
 # =========================================================
 # Cooldown memory
