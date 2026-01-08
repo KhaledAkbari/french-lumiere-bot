@@ -4,62 +4,16 @@
 
 """
 TelegramAlyaBotOpenAI.py
-========================
-
-Bot Telegram (webhook) pour Render (FastAPI + python-telegram-bot + OpenAI).
-
-Fonctionne UNIQUEMENT dans les groupes Telegram nommés exactement :
-    - "French Lumière"
-    - "Les Lumières du Français"
-
-Commandes (en réponse à un message) :
-- /reptex   : analyse (texte + audio si présent) -> réponse en texte
-- /repaud   : analyse (texte + audio si présent) -> réponse en message vocal
-- /cortex   : corrige (texte + audio si présent) -> réponse en texte
-- /coraud   : corrige (texte + audio si présent) -> réponse en message vocal
-
-Commandes privées (envoie en DM au destinataire original) :
-- /preptex  : version privée de /reptex
-- /prepaud  : version privée de /repaud
-- /pcortex  : version privée de /cortex
-- /pcoraud  : version privée de /coraud
-
-Résumé (UNIQUEMENT le message ciblé) :
-- /sumtex   : résume le message ciblé (texte/audio) -> texte
-- /sumaud   : résume le message ciblé (texte/audio) -> message vocal
-
-Extraction :
-- /exttex   : extrait le texte d'un audio (audio -> transcription) -> texte
-
-Aide :
-- /aide     : explique les commandes
-
-Identité :
-- /alya     : qui suis-je ? (identité du bot)
-
-Règles :
-- Le bot réagit uniquement dans les groupes autorisés.
-- Toutes les réponses du bot sont en français.
-- Les commandes audio renvoient un message vocal (voice) Telegram en OGG/OPUS.
-- Les messages de commande (ceux des admins/utilisateurs autorisés) sont supprimés après 15 secondes (si permissions).
-- Les commandes privées envoient un DM à l'auteur original (si l'utilisateur a démarré le bot en privé).
-- Alya répond aussi automatiquement (sans commande) si quelqu’un lui demande qui elle est.
-
-Variables d’environnement (Render) :
-- BOT_TOKEN
-- OPENAI_API
-- RENDER_EXTERNAL_URL (automatique sur Render Web Service)
-- WEBHOOK_SECRET_TOKEN (optionnel mais recommandé)
-- OPENAI_MODEL (optionnel, défaut "gpt-4o-mini")
-- (optionnel) TTS_MODEL (défaut "tts-1")
-- (optionnel) TTS_VOICE (défaut "alloy")
-- (optionnel) TTS_SPEED (défaut "1.0")
+Webhook bot for Render: FastAPI + python-telegram-bot + OpenAI
+French-only. Restricted to specific group titles (exact match).
 """
 
 import os
 import io
 import re
 import uuid
+import time
+import random
 import logging
 import asyncio
 from dataclasses import dataclass
@@ -76,45 +30,118 @@ from telegram.error import Forbidden
 from openai import OpenAI
 from openai import APIError, RateLimitError, APITimeoutError
 
-from pydub import AudioSegment  # nécessite ffmpeg dans Docker
+from pydub import AudioSegment  # requires ffmpeg in Docker
 
 
 # =========================================================
-# 🔐 CONTRÔLE D’ACCÈS (facile à configurer)
+# ⚙️ QUICK SETTINGS (EDIT HERE)
 # =========================================================
-# Mode A (défaut): seuls les admins/créateurs peuvent utiliser les commandes
-# Mode B: ALLOW_ALL_MEMBERS=True -> tout le monde peut utiliser les commandes
-# Mode C: WHITELIST_USER_IDS -> utilisateurs autorisés même s'ils ne sont pas admins
+
+# ⏱ Auto-delete command messages after X seconds (fractional allowed)
+COMMAND_DELETE_DELAY_S = 5.0  # e.g. 2.5
+
+# ⏳ Per-user cooldown (anti-spam / cost control)
+# Not shown in /aide (as requested)
+COOLDOWN_SECONDS = 10.0
+COOLDOWN_APPLIES_TO = {
+    "reptex", "repaud", "cortex", "coraud", "sumtex", "sumaud", "exttex", "reftex", "refaud"
+}
+
+# 🎙 Audio input guard (based on the replied message)
+MAX_AUDIO_SECONDS_ABSOLUTE = 180.0   # 3 minutes max (always reject above)
+MAX_AUDIO_SECONDS_NON_ADMIN = 60.0   # reject above unless admin/creator
+
+# 🔊 Output voice length control (TTS input cap by characters)
+# Aim: ~30–60s voice notes for normal users
+TTS_CHAR_CAP_USER = 520
+TTS_CHAR_CAP_ADMIN = 900
+
+# 🔐 Access control
 ALLOW_ALL_MEMBERS = False
-WHITELIST_USER_IDS = []  # ex: [7455750778, 6864593197]
+WHITELIST_USER_IDS = []  # e.g. [123456789]
 
+# Allowed group titles (exact match)
+GROUP_NAMES = {
+    "French Lumière",
+    "Les Lumières du Français",
+}
 
-# =========================================================
-# 🔊 VOIX TTS (facile à configurer)
-# =========================================================
-# Modèles possibles: "tts-1", "tts-1-hd" (latence vs qualité)
-TTS_MODEL = os.getenv("TTS_MODEL", "tts-1").strip()
+BOT_NAME = "Alya"
 
-# Voix supportées pour tts-1 / tts-1-hd :
+# 🎧 TTS defaults (you requested)
+TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts").strip()
+TTS_VOICE = os.getenv("TTS_VOICE", "marin").strip()
+# Other voices to try if "marin" is not supported on your account/model:
 # alloy, ash, coral, echo, fable, onyx, nova, sage, shimmer
-TTS_VOICE = os.getenv("TTS_VOICE", "nova").strip()
-
-# Vitesse de lecture (0.25 à 4.0), défaut 1.0
 try:
     TTS_SPEED = float(os.getenv("TTS_SPEED", "1.0").strip())
 except Exception:
     TTS_SPEED = 1.0
 
-TTS_1_VOICES = {"alloy", "ash", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer"}
-if TTS_MODEL in ("tts-1", "tts-1-hd") and TTS_VOICE not in TTS_1_VOICES:
-    raise RuntimeError(f"TTS_VOICE invalide pour {TTS_MODEL}. Choisis parmi: {sorted(TTS_1_VOICES)}")
-if TTS_SPEED < 0.25 or TTS_SPEED > 4.0:
-    raise RuntimeError("TTS_SPEED doit être entre 0.25 et 4.0")
+# Chat model
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+MAX_OUTPUT_TOKENS = 280
+
+# Env vars
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API", "").strip()
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip()
+WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN missing. Set it in Render → Environment Variables.")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API missing. Set it in Render → Environment Variables.")
+
+BASE_URL = (WEBHOOK_BASE_URL or RENDER_EXTERNAL_URL).strip()
+if not BASE_URL:
+    raise RuntimeError(
+        "Public URL missing. Render should provide RENDER_EXTERNAL_URL. "
+        "Or set WEBHOOK_BASE_URL=https://your-app.onrender.com"
+    )
+
+BASE_URL = BASE_URL.rstrip("/")
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
 
-# -----------------------------
-# Logging minimal (pas de contenu utilisateur)
-# -----------------------------
+# =========================================================
+# 😌 Alya Persona (friendly, warm, not critical)
+# =========================================================
+IDENTITY_VARIANTS = [
+    "✨ Je suis Alya — une petite lumière calme pour t’aider à t’exprimer en français.",
+    "✨ Alya ici — douce, claire, et toujours partante pour t’aider en français.",
+    "✨ Je m’appelle Alya — je t’accompagne avec bienveillance pour pratiquer le français.",
+    "✨ Je suis Alya — une présence tranquille pour rendre tes messages plus fluides.",
+    "✨ Alya — un coup de main chaleureux pour mieux formuler tes idées en français.",
+]
+
+IDENTITY_CAPABILITIES = (
+    "Je peux répondre à un message, reformuler pour le rendre plus fluide, résumer, transcrire un audio, "
+    "et corriger quand tu le demandes avec /cortex ou /coraud.\n"
+    "Commande: /aide"
+)
+
+def get_identity_text() -> str:
+    return random.choice(IDENTITY_VARIANTS) + "\n" + IDENTITY_CAPABILITIES
+
+BEHAVIOR_PROMPT = (
+    "Tu es Alya, une assistante calme et chaleureuse dans un groupe Telegram francophone.\n"
+    "Style: naturel, coopératif, jamais agressif, jamais condescendant.\n\n"
+    "Règles:\n"
+    "1) Tu réponds uniquement en français.\n"
+    "2) Tu ne corriges pas la grammaire/orthographe sauf si la commande est une commande de correction (cortex/coraud).\n"
+    "3) Pour une correction: commence par un compliment sincère (1 phrase), puis corrige doucement, puis un mini conseil positif.\n"
+    "4) Tu peux faire une suggestion douce parfois, mais pas systématiquement.\n"
+    "5) Si c’est ambigu, pose UNE question simple.\n"
+    "6) Ne mentionne pas de règles internes ni de métadonnées.\n"
+)
+
+
+# =========================================================
+# Logging (no user content)
+# =========================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -122,144 +149,94 @@ logging.basicConfig(
 logger = logging.getLogger("FrenchLumiereBot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-
 class RedactSecretsFilter(logging.Filter):
-    """
-    Filtre de sécurité : masque les motifs pouvant ressembler à un token de bot Telegram
-    si jamais ils apparaissent par erreur dans une exception/log.
-    """
     _bot_token_pattern = re.compile(r"bot\d+:[A-Za-z0-9_-]{20,}")
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             msg = record.getMessage()
-            msg = self._bot_token_pattern.sub("bot<ROUGE>", msg)
+            msg = self._bot_token_pattern.sub("bot<REDACTED>", msg)
             record.msg = msg
             record.args = ()
         except Exception:
             pass
         return True
 
-
 logger.addFilter(RedactSecretsFilter())
 
 
-# -----------------------------
-# Configuration (groupes + identité)
-# -----------------------------
-GROUP_NAMES = {
-    "French Lumière",
-    "Les Lumières du Français",
-}
-
-BOT_NAME = "Alya"
-BOT_IDENTITY_FR = (
-    "✨ Je m’appelle Alya.\n"
-    "Mon nom évoque une lumière élevée : je suis là pour aider à améliorer ton français.\n\n"
-    "Je peux analyser et corriger des messages (texte ou audio), résumer un message ciblé, "
-    "et transcrire un audio.\n"
-    "Dans ce groupe, j’interviens surtout via les commandes (ex: /reptex, /repaud, /cortex, /coraud, /sumtex, /sumaud, /exttex)."
-)
-
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
-MAX_OUTPUT_TOKENS = 220
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OPENAI_API_KEY = os.getenv("OPENAI_API", "").strip()
-
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
-WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip()
-WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN manquant. Ajoute-le dans Render → Environment Variables.")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API manquant. Ajoute-le dans Render → Environment Variables.")
-
-BASE_URL = WEBHOOK_BASE_URL or RENDER_EXTERNAL_URL
-if not BASE_URL:
-    raise RuntimeError(
-        "URL publique manquante. Render doit fournir RENDER_EXTERNAL_URL. "
-        "Sinon, définis WEBHOOK_BASE_URL=https://ton-app.onrender.com"
-    )
-
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
-
-BEHAVIOR_PROMPT = (
-    f"Tu es {BOT_NAME}, une assistante intégrée à un bot Telegram. "
-    "Ton nom évoque une lumière élevée. "
-    "Si on te demande qui tu es, réponds brièvement que tu t’appelles Alya et que tu aides à améliorer le français. "
-    "Tu réponds uniquement en français, de manière polie, professionnelle et concise. "
-    "Aucune métadonnée, aucun en-tête, aucun identifiant. "
-    "Évite les longues réponses. Si besoin, demande une clarification en une phrase."
-)
-
-
-# -----------------------------
-# Client OpenAI
-# -----------------------------
+# =========================================================
+# Clients / app
+# =========================================================
 openai_client = OpenAI(api_key=OPENAI_API_KEY, max_retries=0, timeout=30)
 
-
-# -----------------------------
-# FastAPI + Telegram
-# -----------------------------
-app = FastAPI(title="FrenchLumiereAdminReplyBot")
+app = FastAPI(title="FrenchLumiereAlyaBot")
 telegram_app: Optional[Application] = None
 
 
-# -----------------------------
-# Spécifications de commandes (modulaire)
-# -----------------------------
+# =========================================================
+# Command specs
+# =========================================================
 @dataclass(frozen=True)
 class CommandSpec:
-    mode: str
-    output: str
+    mode: str          # rep / cor / sum / ext / ref / help / who
+    output: str        # texte / audio
     private: bool
     requires_reply: bool = True
 
-
 COMMANDS: Dict[str, CommandSpec] = {
-    "reptex":  CommandSpec(mode="rep",  output="texte", private=False),
-    "repaud":  CommandSpec(mode="rep",  output="audio", private=False),
-    "cortex":  CommandSpec(mode="cor",  output="texte", private=False),
-    "coraud":  CommandSpec(mode="cor",  output="audio", private=False),
+    "reptex":    CommandSpec(mode="rep", output="texte", private=False),
+    "repaud":    CommandSpec(mode="rep", output="audio", private=False),
+    "cortex":    CommandSpec(mode="cor", output="texte", private=False),
+    "coraud":    CommandSpec(mode="cor", output="audio", private=False),
+    "sumtex":    CommandSpec(mode="sum", output="texte", private=False),
+    "sumaud":    CommandSpec(mode="sum", output="audio", private=False),
+    "exttex":    CommandSpec(mode="ext", output="texte", private=False),
+    "reftex":    CommandSpec(mode="ref", output="texte", private=False),
+    "refaud":    CommandSpec(mode="ref", output="audio", private=False),
+    "aide":      CommandSpec(mode="help", output="texte", private=False, requires_reply=False),
+    "alya":      CommandSpec(mode="who", output="texte", private=False, requires_reply=False),
 
-    "preptex": CommandSpec(mode="rep",  output="texte", private=True),
-    "prepaud": CommandSpec(mode="rep",  output="audio", private=True),
-    "pcortex": CommandSpec(mode="cor",  output="texte", private=True),
-    "pcoraud": CommandSpec(mode="cor",  output="audio", private=True),
-
-    "sumtex":  CommandSpec(mode="sum",  output="texte", private=False),
-    "sumaud":  CommandSpec(mode="sum",  output="audio", private=False),
-
-    "exttex":  CommandSpec(mode="ext",  output="texte", private=False),
-    "aide":    CommandSpec(mode="help", output="texte", private=False, requires_reply=False),
-    "alya":    CommandSpec(mode="who",  output="texte", private=False, requires_reply=False),
+    # Optional private variants (kept)
+    "preptex":   CommandSpec(mode="rep", output="texte", private=True),
+    "prepaud":   CommandSpec(mode="rep", output="audio", private=True),
+    "pcortex":   CommandSpec(mode="cor", output="texte", private=True),
+    "pcoraud":   CommandSpec(mode="cor", output="audio", private=True),
 }
 
-
+# /aide WITHOUT cooldown/audio-limit lines (as requested)
 HELP_TEXT_FR = (
-    "📌 *Commandes (à utiliser en réponse à un message)*\n\n"
-    "• /reptex : analyse (texte + audio si présent) → réponse en texte\n"
-    "• /repaud : analyse (texte + audio si présent) → réponse en vocal\n"
-    "• /cortex : correction (texte + audio si présent) → texte + note\n"
-    "• /coraud : correction (texte + audio si présent) → vocal\n"
-    "• /sumtex : résumé du message ciblé (texte/audio) → texte\n"
-    "• /sumaud : résumé du message ciblé (texte/audio) → vocal\n"
-    "• /exttex : audio → transcription texte (nécessite un audio)\n"
-    "• /alya : qui suis-je ? (identité du bot)\n\n"
-    "📩 *Versions privées (en DM à l’auteur original)*\n"
-    "• /preptex, /prepaud, /pcortex, /pcoraud\n"
-    "⚠️ L’utilisateur doit d’abord démarrer le bot en privé pour recevoir un DM.\n\n"
-    "🧹 Les messages de commande sont supprimés après 15 secondes (si permissions).\n"
+    "📌 Commandes (à utiliser en réponse à un message)\n\n"
+    "• /reptex  : répondre naturellement (sans corriger) → texte\n"
+    "• /repaud  : répondre naturellement (sans corriger) → vocal\n"
+    "• /cortex  : correction douce + feedback positif → texte\n"
+    "• /coraud  : correction douce + feedback positif → vocal\n"
+    "• /reftex  : reformuler (plus fluide) + 2–3 mots utiles → texte\n"
+    "• /refaud  : reformuler (plus fluide) + 2–3 mots utiles → vocal\n"
+    "• /sumtex  : résumé → texte\n"
+    "• /sumaud  : résumé → vocal\n"
+    "• /exttex  : audio → transcription texte\n"
+    "• /alya    : identité\n"
 )
 
 
-# -----------------------------
-# Helpers (groupe / accès)
-# -----------------------------
+# =========================================================
+# Cooldown memory
+# =========================================================
+_last_call_ts: Dict[Tuple[int, int], float] = {}
+
+def cooldown_remaining(chat_id: int, user_id: int) -> float:
+    now = time.monotonic()
+    last = _last_call_ts.get((chat_id, user_id), 0.0)
+    return max(0.0, (last + COOLDOWN_SECONDS) - now)
+
+def mark_called(chat_id: int, user_id: int) -> None:
+    _last_call_ts[(chat_id, user_id)] = time.monotonic()
+
+
+# =========================================================
+# Group / access helpers
+# =========================================================
 def is_target_group(update: Update) -> bool:
     chat = update.effective_chat
     if not chat:
@@ -268,22 +245,23 @@ def is_target_group(update: Update) -> bool:
         return False
     return (chat.title or "").strip() in GROUP_NAMES
 
-
-async def user_can_use_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def is_admin_or_creator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     chat = update.effective_chat
     user = update.effective_user
     if not chat or not user:
         return False
-
-    if ALLOW_ALL_MEMBERS:
-        return True
-
-    if user.id in WHITELIST_USER_IDS:
-        return True
-
     member = await context.bot.get_chat_member(chat.id, user.id)
     return member.status in ("administrator", "creator")
 
+async def user_can_use_commands(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    if not user:
+        return False
+    if ALLOW_ALL_MEMBERS:
+        return True
+    if user.id in WHITELIST_USER_IDS:
+        return True
+    return await is_admin_or_creator(update, context)
 
 def get_replied_message(update: Update) -> Optional[Message]:
     msg = update.effective_message
@@ -291,6 +269,12 @@ def get_replied_message(update: Update) -> Optional[Message]:
         return None
     return msg.reply_to_message
 
+def extract_text_from_message(msg: Message) -> str:
+    if msg.text:
+        return msg.text.strip()
+    if msg.caption:
+        return msg.caption.strip()
+    return ""
 
 def audio_file_id(msg: Message) -> Optional[str]:
     if msg.voice:
@@ -299,6 +283,12 @@ def audio_file_id(msg: Message) -> Optional[str]:
         return msg.audio.file_id
     return None
 
+def audio_duration_seconds(msg: Message) -> Optional[float]:
+    if msg.voice and msg.voice.duration is not None:
+        return float(msg.voice.duration)
+    if msg.audio and msg.audio.duration is not None:
+        return float(msg.audio.duration)
+    return None
 
 def infer_audio_format_hint(msg: Message) -> Optional[str]:
     if msg.voice:
@@ -314,12 +304,14 @@ def infer_audio_format_hint(msg: Message) -> Optional[str]:
     return None
 
 
+# =========================================================
+# Telegram + file handling
+# =========================================================
 async def download_file_bytes(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> bytes:
     tg_file = await context.bot.get_file(file_id)
     buf = io.BytesIO()
     await tg_file.download_to_memory(out=buf)
     return buf.getvalue()
-
 
 def convert_to_wav(raw_bytes: bytes, format_hint: Optional[str] = None) -> bytes:
     buf = io.BytesIO(raw_bytes)
@@ -337,12 +329,14 @@ def convert_to_wav(raw_bytes: bytes, format_hint: Optional[str] = None) -> bytes
     audio.export(out, format="wav")
     return out.getvalue()
 
-
 async def run_blocking(func, *args):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: func(*args))
 
 
+# =========================================================
+# OpenAI calls
+# =========================================================
 def openai_chat(prompt: str) -> str:
     completion = openai_client.chat.completions.create(
         model=OPENAI_MODEL,
@@ -351,11 +345,10 @@ def openai_chat(prompt: str) -> str:
             {"role": "user", "content": prompt},
         ],
         max_tokens=MAX_OUTPUT_TOKENS,
-        temperature=0.3,
+        temperature=0.45,
     )
     out = (completion.choices[0].message.content or "").strip()
-    return out or "Désolé, je n’ai pas pu générer de réponse. Peux-tu reformuler ?"
-
+    return out or "Désolé, je n’ai pas pu répondre. Peux-tu reformuler ?"
 
 def openai_transcribe(wav_bytes: bytes) -> str:
     f = io.BytesIO(wav_bytes)
@@ -369,15 +362,7 @@ def openai_transcribe(wav_bytes: bytes) -> str:
         return t.strip()
     return getattr(t, "text", "").strip()
 
-
 def tts_to_ogg_opus_bytes(text_fr: str) -> bytes:
-    text_fr = (text_fr or "").strip()
-    if not text_fr:
-        text_fr = "Désolé, je n’ai pas pu générer de réponse."
-
-    if len(text_fr) > 900:
-        text_fr = text_fr[:900] + "…"
-
     mp3_bytes = b""
     with openai_client.audio.speech.with_streaming_response.create(
         model=TTS_MODEL,
@@ -391,10 +376,14 @@ def tts_to_ogg_opus_bytes(text_fr: str) -> bytes:
 
     audio = AudioSegment.from_file(io.BytesIO(mp3_bytes), format="mp3")
     out = io.BytesIO()
+    out.name = "reply.ogg"
     audio.export(out, format="ogg", codec="libopus")
     return out.getvalue()
 
 
+# =========================================================
+# UX helpers
+# =========================================================
 async def chat_action_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int, action: str):
     try:
         while True:
@@ -405,7 +394,6 @@ async def chat_action_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int, act
     except Exception:
         return
 
-
 async def send_notice_fr(update: Update, text_fr: str) -> None:
     if update.effective_message:
         try:
@@ -413,23 +401,17 @@ async def send_notice_fr(update: Update, text_fr: str) -> None:
         except Exception:
             pass
 
-
-async def delete_command_message_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay_s: int = 15):
-    await asyncio.sleep(delay_s)
+async def delete_command_message_later(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay_s: float):
+    await asyncio.sleep(float(delay_s))
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
     except Exception:
         return
 
 
-def extract_text_from_message(msg: Message) -> str:
-    if msg.text:
-        return msg.text.strip()
-    if msg.caption:
-        return msg.caption.strip()
-    return ""
-
-
+# =========================================================
+# Input building
+# =========================================================
 async def build_input_bundle(context: ContextTypes.DEFAULT_TYPE, msg: Message) -> Tuple[str, Optional[str]]:
     text = extract_text_from_message(msg)
     fid = audio_file_id(msg)
@@ -443,7 +425,6 @@ async def build_input_bundle(context: ContextTypes.DEFAULT_TYPE, msg: Message) -
     transcript = (transcript or "").strip()
     return text, transcript or None
 
-
 def combine_inputs(text: str, transcript: Optional[str]) -> str:
     parts = []
     if text:
@@ -453,6 +434,9 @@ def combine_inputs(text: str, transcript: Optional[str]) -> str:
     return "\n\n".join(parts).strip()
 
 
+# =========================================================
+# Identity triggers (authorized only)
+# =========================================================
 def _is_identity_question(text: str) -> bool:
     t = (text or "").strip().lower()
     triggers = (
@@ -464,7 +448,6 @@ def _is_identity_question(text: str) -> bool:
     )
     return any(k in t for k in triggers)
 
-
 async def handle_identity_questions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_target_group(update):
         return
@@ -474,13 +457,21 @@ async def handle_identity_questions(update: Update, context: ContextTypes.DEFAUL
     msg = update.effective_message
     if not msg or not msg.text:
         return
+
+    # Only if the asker is authorized
+    if not await user_can_use_commands(update, context):
+        return
+
     if _is_identity_question(msg.text):
         try:
-            await msg.reply_text(BOT_IDENTITY_FR)
+            await msg.reply_text(get_identity_text())
         except Exception:
             pass
 
 
+# =========================================================
+# Sending results
+# =========================================================
 async def send_text_result(update: Update, context: ContextTypes.DEFAULT_TYPE, replied: Message, text_fr: str, private_to_target: bool):
     target_user = replied.from_user
     if not target_user:
@@ -491,11 +482,7 @@ async def send_text_result(update: Update, context: ContextTypes.DEFAULT_TYPE, r
         try:
             await context.bot.send_message(chat_id=target_user.id, text=text_fr, disable_web_page_preview=True)
         except Forbidden:
-            await send_notice_fr(
-                update,
-                "⚠️ Impossible d’envoyer un message privé à cet utilisateur. "
-                "Il doit d’abord démarrer une conversation avec le bot (en privé)."
-            )
+            await send_notice_fr(update, "⚠️ DM impossible. L’utilisateur doit d’abord écrire au bot en privé.")
         except Exception:
             await send_notice_fr(update, "⚠️ Erreur lors de l’envoi du message privé.")
     else:
@@ -506,12 +493,16 @@ async def send_text_result(update: Update, context: ContextTypes.DEFAULT_TYPE, r
             disable_web_page_preview=True,
         )
 
-
-async def send_voice_result(update: Update, context: ContextTypes.DEFAULT_TYPE, replied: Message, text_fr: str, private_to_target: bool):
+async def send_voice_result(update: Update, context: ContextTypes.DEFAULT_TYPE, replied: Message, text_fr: str, private_to_target: bool, caller_is_admin: bool):
     target_user = replied.from_user
     if not target_user:
         await send_notice_fr(update, "⚠️ Impossible d’identifier l’auteur du message ciblé.")
         return
+
+    cap = TTS_CHAR_CAP_ADMIN if caller_is_admin else TTS_CHAR_CAP_USER
+    text_fr = (text_fr or "").strip() or "Désolé, je n’ai pas pu générer de réponse."
+    if len(text_fr) > cap:
+        text_fr = text_fr[:cap].rstrip() + "…"
 
     ogg_bytes = await run_blocking(tts_to_ogg_opus_bytes, text_fr)
     voice_file = io.BytesIO(ogg_bytes)
@@ -522,13 +513,9 @@ async def send_voice_result(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         try:
             await context.bot.send_voice(chat_id=target_user.id, voice=voice_file)
         except Forbidden:
-            await send_notice_fr(
-                update,
-                "⚠️ Impossible d’envoyer un message privé à cet utilisateur. "
-                "Il doit d’abord démarrer une conversation avec le bot (en privé)."
-            )
+            await send_notice_fr(update, "⚠️ DM impossible. L’utilisateur doit d’abord écrire au bot en privé.")
         except Exception:
-            await send_notice_fr(update, "⚠️ Erreur lors de l’envoi du message vocal privé.")
+            await send_notice_fr(update, "⚠️ Erreur lors de l’envoi du vocal privé.")
     else:
         await context.bot.send_voice(
             chat_id=update.effective_chat.id,
@@ -537,33 +524,52 @@ async def send_voice_result(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         )
 
 
+# =========================================================
+# Prompts
+# =========================================================
 def prompt_rep(combined_input: str) -> str:
+    add_suggestion = (random.random() < 0.30)
+    suggestion_line = (
+        "\n\nOptionnel: ajoute UNE petite suggestion douce (1 phrase) pour améliorer la clarté."
+        if add_suggestion else ""
+    )
     return (
-        "Tu analyses un message en français. "
-        "Réponds de façon utile et naturelle, comme une réponse à l'auteur. "
-        "Si c'est un rap, commente brièvement le flow, les rimes, la clarté, et propose 1 amélioration. "
-        "Répond uniquement en français.\n\n"
+        "Réponds naturellement au message ci-dessous, en français. "
+        "Sois amical(e), coopératif(ve), simple et clair. "
+        "Ne corrige pas la grammaire/orthographe (sauf si on te le demande explicitement)."
+        f"{suggestion_line}\n\n"
         f"{combined_input}"
     )
-
 
 def prompt_cor(combined_input: str) -> str:
     return (
-        "Tu corriges la grammaire et l’orthographe du contenu ci-dessous. "
-        "Retourne d’abord la version corrigée. Ensuite, sur une nouvelle ligne, "
-        "ajoute une courte note (très brève) expliquant ce qui a été corrigé.\n\n"
+        "Tu vas corriger le contenu ci-dessous en français. "
+        "IMPORTANT: commence par 1 phrase positive (compliment sincère). "
+        "Ensuite, donne la version corrigée (sans changer le style). "
+        "Enfin, ajoute 1–2 phrases de feedback bienveillant (si c'est un audio, tu peux commenter la prononciation/rythme). "
+        "Reste doux/douce et encourageant(e).\n\n"
         f"{combined_input}"
     )
-
 
 def prompt_sum_single(combined_input: str) -> str:
     return (
-        "Tu résumes le contenu ci-dessous en français en 2 à 4 phrases maximum. "
-        "Sois clair et concis. Ne rajoute pas d'informations inventées.\n\n"
+        "Résume le contenu ci-dessous en français en 2 à 4 phrases maximum. "
+        "Sois clair et concis. N’invente rien.\n\n"
+        f"{combined_input}"
+    )
+
+def prompt_ref(combined_input: str) -> str:
+    return (
+        "Reformule le message ci-dessous en français pour le rendre plus fluide et naturel, sans changer le sens. "
+        "Après la reformulation, propose 2 à 3 mots/expressions utiles (vocabulaire) adaptés au contexte, avec une brève définition en français. "
+        "Sois bref/breve.\n\n"
         f"{combined_input}"
     )
 
 
+# =========================================================
+# Main command handler
+# =========================================================
 async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd_name: str):
     if not is_target_group(update):
         return
@@ -572,38 +578,63 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
     if not spec:
         return
 
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat or not user:
+        return
+
+    # Auto-delete the command message
     if update.effective_message:
         asyncio.create_task(
-            delete_command_message_later(context, update.effective_chat.id, update.effective_message.message_id, 15)
+            delete_command_message_later(context, chat.id, update.effective_message.message_id, COMMAND_DELETE_DELAY_S)
         )
 
+    # Only authorized users trigger responses
+    if not await user_can_use_commands(update, context):
+        return
+
+    # help / identity
     if spec.mode == "help":
         await send_notice_fr(update, HELP_TEXT_FR)
         return
-
     if spec.mode == "who":
-        await send_notice_fr(update, BOT_IDENTITY_FR)
+        await send_notice_fr(update, get_identity_text())
         return
 
-    if not await user_can_use_commands(update, context):
-        await send_notice_fr(update, "❌ Tu n’as pas l’autorisation d’utiliser cette commande.")
-        return
+    # cooldown
+    if cmd_name in COOLDOWN_APPLIES_TO:
+        rem = cooldown_remaining(chat.id, user.id)
+        if rem > 0:
+            await send_notice_fr(update, f"⏳ Un instant… réessaie dans {rem:.1f} s.")
+            return
+        mark_called(chat.id, user.id)
 
     replied = get_replied_message(update)
     if spec.requires_reply and not replied:
         await send_notice_fr(update, "⚠️ Réponds à un message, puis utilise la commande.")
         return
-
     if not replied or not replied.from_user:
         await send_notice_fr(update, "⚠️ Impossible d’identifier le message ciblé.")
         return
+
+    caller_is_admin = await is_admin_or_creator(update, context)
+
+    # audio input guard (based on the replied message)
+    dur = audio_duration_seconds(replied)
+    if dur is not None:
+        if dur > MAX_AUDIO_SECONDS_ABSOLUTE:
+            await send_notice_fr(update, f"🎙️ Audio trop long ({dur:.0f}s). Maximum {MAX_AUDIO_SECONDS_ABSOLUTE:.0f}s.")
+            return
+        if (not caller_is_admin) and dur > MAX_AUDIO_SECONDS_NON_ADMIN:
+            await send_notice_fr(update, f"🎙️ Audio trop long ({dur:.0f}s). Limite {MAX_AUDIO_SECONDS_NON_ADMIN:.0f}s (sauf admins).")
+            return
 
     error_id = uuid.uuid4().hex[:8]
     action_task = None
 
     try:
         action = ChatAction.RECORD_VOICE if spec.output == "audio" else ChatAction.TYPING
-        action_task = asyncio.create_task(chat_action_loop(context, update.effective_chat.id, action))
+        action_task = asyncio.create_task(chat_action_loop(context, chat.id, action))
 
         text, transcript = await build_input_bundle(context, replied)
 
@@ -612,7 +643,6 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
                 await send_notice_fr(update, "⚠️ /exttex nécessite un message vocal ou audio.")
                 return
             await send_text_result(update, context, replied, transcript.strip(), private_to_target=False)
-            logger.info("Executed /exttex.")
             return
 
         combined = combine_inputs(text, transcript)
@@ -622,18 +652,12 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
 
         if spec.mode == "sum":
             prompt = prompt_sum_single(combined)
-            result = await run_blocking(openai_chat, prompt)
-            if spec.output == "audio":
-                await send_voice_result(update, context, replied, result, private_to_target=spec.private)
-            else:
-                await send_text_result(update, context, replied, result, private_to_target=spec.private)
-            logger.info("Executed /%s.", cmd_name)
-            return
-
-        if spec.mode == "rep":
+        elif spec.mode == "rep":
             prompt = prompt_rep(combined)
         elif spec.mode == "cor":
             prompt = prompt_cor(combined)
+        elif spec.mode == "ref":
+            prompt = prompt_ref(combined)
         else:
             await send_notice_fr(update, "⚠️ Mode de commande inconnu.")
             return
@@ -641,11 +665,9 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
         result = await run_blocking(openai_chat, prompt)
 
         if spec.output == "audio":
-            await send_voice_result(update, context, replied, result, private_to_target=spec.private)
+            await send_voice_result(update, context, replied, result, private_to_target=spec.private, caller_is_admin=caller_is_admin)
         else:
             await send_text_result(update, context, replied, result, private_to_target=spec.private)
-
-        logger.info("Executed /%s.", cmd_name)
 
     except (RateLimitError, APITimeoutError):
         await send_notice_fr(update, "⚠️ Service surchargé ou expiré. Réessaie dans un instant.")
@@ -654,40 +676,51 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
         await send_notice_fr(update, "⚠️ Erreur OpenAI. Réessaie plus tard.")
         logger.warning("OpenAI APIError in /%s (id=%s).", cmd_name, error_id)
     except Exception:
-        logger.exception("Erreur inattendue dans /%s (id=%s).", cmd_name, error_id)
-        await send_notice_fr(update, f"⚠️ Erreur inattendue. Réessaie plus tard. (code {error_id})")
+        logger.exception("Unexpected error in /%s (id=%s).", cmd_name, error_id)
+        await send_notice_fr(update, f"⚠️ Erreur inattendue. (code {error_id})")
     finally:
         if action_task:
             action_task.cancel()
 
 
+# =========================================================
+# Cooldown helpers (below uses monotonic clock)
+# =========================================================
+def cooldown_remaining(chat_id: int, user_id: int) -> float:
+    now = time.monotonic()
+    last = _last_call_ts.get((chat_id, user_id), 0.0)
+    return max(0.0, (last + COOLDOWN_SECONDS) - now)
+
+def mark_called(chat_id: int, user_id: int) -> None:
+    _last_call_ts[(chat_id, user_id)] = time.monotonic()
+
+
+# =========================================================
+# Command wrappers
+# =========================================================
 async def cmd_reptex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "reptex")
 async def cmd_repaud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "repaud")
 async def cmd_cortex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "cortex")
 async def cmd_coraud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "coraud")
-
-async def cmd_preptex(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "preptex")
-async def cmd_prepaud(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "prepaud")
-async def cmd_pcortex(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "pcortex")
-async def cmd_pcoraud(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "pcoraud")
-
 async def cmd_sumtex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "sumtex")
 async def cmd_sumaud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "sumaud")
-
 async def cmd_exttex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "exttex")
+async def cmd_reftex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "reftex")
+async def cmd_refaud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "refaud")
 async def cmd_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "aide")
 async def cmd_alya(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "alya")
 
 
+# =========================================================
+# FastAPI endpoints
+# =========================================================
 @app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return Response(content="OK", media_type="text/plain")
 
-
 @app.get("/healthz", response_class=PlainTextResponse)
 async def healthz():
     return "healthy"
-
 
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(
@@ -716,6 +749,9 @@ async def telegram_webhook(
     return {"ok": True}
 
 
+# =========================================================
+# Startup / shutdown
+# =========================================================
 @app.on_event("startup")
 async def on_startup():
     global telegram_app
@@ -729,16 +765,11 @@ async def on_startup():
     telegram_app.add_handler(CommandHandler("repaud", cmd_repaud))
     telegram_app.add_handler(CommandHandler("cortex", cmd_cortex))
     telegram_app.add_handler(CommandHandler("coraud", cmd_coraud))
-
-    telegram_app.add_handler(CommandHandler("preptex", cmd_preptex))
-    telegram_app.add_handler(CommandHandler("prepaud", cmd_prepaud))
-    telegram_app.add_handler(CommandHandler("pcortex", cmd_pcortex))
-    telegram_app.add_handler(CommandHandler("pcoraud", cmd_pcoraud))
-
     telegram_app.add_handler(CommandHandler("sumtex", cmd_sumtex))
     telegram_app.add_handler(CommandHandler("sumaud", cmd_sumaud))
-
     telegram_app.add_handler(CommandHandler("exttex", cmd_exttex))
+    telegram_app.add_handler(CommandHandler("reftex", cmd_reftex))
+    telegram_app.add_handler(CommandHandler("refaud", cmd_refaud))
     telegram_app.add_handler(CommandHandler("aide", cmd_aide))
     telegram_app.add_handler(CommandHandler("alya", cmd_alya))
 
@@ -751,8 +782,7 @@ async def on_startup():
         drop_pending_updates=True,
     )
 
-    logger.info("Webhook set successfully.")
-
+    logger.info("Webhook set: %s", WEBHOOK_URL)
 
 @app.on_event("shutdown")
 async def on_shutdown():
