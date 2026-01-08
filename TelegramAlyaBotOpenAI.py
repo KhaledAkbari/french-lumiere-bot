@@ -72,8 +72,8 @@ Recommended (security):
 
 Optional:
 - OPENAI_MODEL (default: gpt-4o-mini)
-- TTS_MODEL    (default: gpt-4o-mini-tts)
-- TTS_VOICE    (default: marin)
+- TTS_MODEL    (default: tts-1)
+- TTS_VOICE    (default: nova)
 - TTS_SPEED    (default: 1.0)
 - WEBHOOK_BASE_URL (only if you need to override Render URL)
 
@@ -100,7 +100,7 @@ from fastapi import FastAPI, Request, Header, HTTPException, Response
 from fastapi.responses import PlainTextResponse
 
 from telegram import Update, Message
-from telegram.constants import ChatType, ChatAction
+from telegram.constants import ChatType, ChatAction, ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.error import Forbidden
 
@@ -146,10 +146,10 @@ GROUP_NAMES = {
 
 BOT_NAME = "Alya"
 
-# 🎧 TTS defaults (you requested)
-TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts").strip()
-TTS_VOICE = os.getenv("TTS_VOICE", "marin").strip()
-# Alternatives (if marin not available for your account/model):
+# 🎧 TTS defaults (YOU REQUESTED: tts-1 + nova)
+TTS_MODEL = os.getenv("TTS_MODEL", "tts-1").strip()
+TTS_VOICE = os.getenv("TTS_VOICE", "nova").strip()
+# Alternatives:
 # alloy, ash, coral, echo, fable, onyx, nova, sage, shimmer
 try:
     TTS_SPEED = float(os.getenv("TTS_SPEED", "1.0").strip())
@@ -282,7 +282,6 @@ COMMANDS: Dict[str, CommandSpec] = {
     "pcoraud": CommandSpec(mode="cor", output="audio", private=True),
 }
 
-# /aide WITHOUT cooldown/audio limit lines (as requested)
 HELP_TEXT_FR = (
     "📌 *Commandes (à utiliser en réponse à un message)*\n\n"
     "• /reptex : répondre naturellement (texte + audio si présent) → *texte*\n"
@@ -300,6 +299,7 @@ HELP_TEXT_FR = (
     "⚠️ L’utilisateur doit d’abord démarrer le bot en privé pour recevoir un DM.\n\n"
     "🧹 Les messages de commande sont supprimés automatiquement (si permissions).\n"
 )
+
 
 # =========================================================
 # Cooldown memory
@@ -475,10 +475,10 @@ async def chat_action_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int, act
     except Exception:
         return
 
-async def send_notice_fr(update: Update, text_fr: str) -> None:
+async def send_notice_fr(update: Update, text_fr: str, parse_mode: Optional[str] = None) -> None:
     if update.effective_message:
         try:
-            await update.effective_message.reply_text(text_fr)
+            await update.effective_message.reply_text(text_fr, parse_mode=parse_mode)
         except Exception:
             pass
 
@@ -675,7 +675,7 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
 
     # help / identity
     if spec.mode == "help":
-        await send_notice_fr(update, HELP_TEXT_FR)
+        await send_notice_fr(update, HELP_TEXT_FR, parse_mode=ParseMode.MARKDOWN)
         return
     if spec.mode == "who":
         await send_notice_fr(update, get_identity_text())
