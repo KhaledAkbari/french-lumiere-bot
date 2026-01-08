@@ -4,8 +4,85 @@
 
 """
 TelegramAlyaBotOpenAI.py
-Webhook bot for Render: FastAPI + python-telegram-bot + OpenAI
-French-only. Restricted to specific group titles (exact match).
+========================
+
+Backend Telegram Bot (webhook) for Render:
+- FastAPI + Uvicorn
+- python-telegram-bot (webhook mode)
+- OpenAI (chat + Whisper transcription + TTS)
+- pydub + ffmpeg (audio conversions)
+
+GOAL
+----
+Alya is a friendly, warm French helper in specific Telegram groups.
+She ONLY responds when an authorized user triggers her via commands.
+
+WHERE IT WORKS
+--------------
+Only inside Telegram groups whose title matches exactly:
+- "French Lumière"
+- "Les Lumières du Français"
+
+ACCESS RULE
+-----------
+Alya responds ONLY if the command sender is authorized:
+- Admin/Creator OR
+- WHITELIST_USER_IDS OR
+- ALLOW_ALL_MEMBERS=True
+
+COMMANDS (use as a reply to a message)
+--------------------------------------
+/reptex   : natural helpful reply (no grammar correction) -> text
+/repaud   : natural helpful reply (no grammar correction) -> voice note (OGG/OPUS)
+/cortex   : friendly correction + positive tone + feedback (incl. speech if audio) -> text
+/coraud   : friendly correction + positive tone + feedback -> voice note
+/reftex   : reformulate (more fluid) + 2–3 vocab suggestions -> text
+/refaud   : reformulate (more fluid) + 2–3 vocab suggestions -> voice note
+/sumtex   : summarize target message -> text
+/sumaud   : summarize target message -> voice note
+/exttex   : transcribe target audio/voice -> text
+/aide     : show commands
+/alya     : who is Alya? (identity)
+
+AUDIO INPUT LIMITS (protect costs)
+---------------------------------
+Based on the TARGET (replied) voice/audio duration:
+- If > 180s (3 minutes): ALWAYS refuse for everyone
+- If > 60s: refuse unless caller is Admin/Creator
+When refusing, Alya sends a “too long” message.
+
+AUDIO OUTPUT LENGTH (voice notes)
+---------------------------------
+We keep /repaud, /coraud, /refaud, /sumaud generally within ~30–60 seconds
+by limiting TTS input text length (character cap). Admins can receive longer.
+
+PERSONA
+-------
+Alya means “light/elevated”. She should sound calm, supportive, never aggressive.
+She should NOT correct grammar unless the user used /cortex or /coraud.
+
+RENDER ENVIRONMENT VARIABLES
+----------------------------
+Required:
+- BOT_TOKEN
+- OPENAI_API
+
+Recommended (security):
+- WEBHOOK_SECRET_TOKEN
+
+Optional:
+- OPENAI_MODEL (default: gpt-4o-mini)
+- TTS_MODEL    (default: gpt-4o-mini-tts)
+- TTS_VOICE    (default: marin)
+- TTS_SPEED    (default: 1.0)
+- WEBHOOK_BASE_URL (only if you need to override Render URL)
+
+Render provides automatically:
+- PORT
+- (usually) RENDER_EXTERNAL_URL
+
+Health check endpoint:
+- GET /healthz -> "healthy"
 """
 
 import os
@@ -40,19 +117,20 @@ from pydub import AudioSegment  # requires ffmpeg in Docker
 # ⏱ Auto-delete command messages after X seconds (fractional allowed)
 COMMAND_DELETE_DELAY_S = 5.0  # e.g. 2.5
 
-# ⏳ Per-user cooldown (anti-spam / cost control)
-# Not shown in /aide (as requested)
-COOLDOWN_SECONDS = 10.0
+# ⏳ Per-user cooldown (anti-spam / cost control) — NOT shown in /aide
+COOLDOWN_SECONDS = 5.0
 COOLDOWN_APPLIES_TO = {
-    "reptex", "repaud", "cortex", "coraud", "sumtex", "sumaud", "exttex", "reftex", "refaud"
+    "reptex", "repaud", "cortex", "coraud",
+    "reftex", "refaud",
+    "sumtex", "sumaud",
+    "exttex",
 }
 
-# 🎙 Audio input guard (based on the replied message)
-MAX_AUDIO_SECONDS_ABSOLUTE = 180.0   # 3 minutes max (always reject above)
-MAX_AUDIO_SECONDS_NON_ADMIN = 60.0   # reject above unless admin/creator
+# 🎙 Audio input guard (based on replied message duration)
+MAX_AUDIO_SECONDS_ABSOLUTE = 180.0   # >3min always reject
+MAX_AUDIO_SECONDS_NON_ADMIN = 60.0   # >60s reject unless admin/creator
 
-# 🔊 Output voice length control (TTS input cap by characters)
-# Aim: ~30–60s voice notes for normal users
+# 🔊 Voice note output length control (by limiting TTS text input)
 TTS_CHAR_CAP_USER = 520
 TTS_CHAR_CAP_ADMIN = 900
 
@@ -71,7 +149,7 @@ BOT_NAME = "Alya"
 # 🎧 TTS defaults (you requested)
 TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts").strip()
 TTS_VOICE = os.getenv("TTS_VOICE", "marin").strip()
-# Other voices to try if "marin" is not supported on your account/model:
+# Alternatives (if marin not available for your account/model):
 # alloy, ash, coral, echo, fable, onyx, nova, sage, shimmer
 try:
     TTS_SPEED = float(os.getenv("TTS_SPEED", "1.0").strip())
@@ -80,11 +158,12 @@ except Exception:
 
 # Chat model
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
-MAX_OUTPUT_TOKENS = 280
+MAX_OUTPUT_TOKENS = 200
 
 # Env vars
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API", "").strip()
+
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
 WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").strip()
 WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "").strip()
@@ -107,7 +186,7 @@ WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
 
 # =========================================================
-# 😌 Alya Persona (friendly, warm, not critical)
+# 😌 Alya Persona (friendly, warm, never aggressive)
 # =========================================================
 IDENTITY_VARIANTS = [
     "✨ Je suis Alya — une petite lumière calme pour t’aider à t’exprimer en français.",
@@ -132,7 +211,7 @@ BEHAVIOR_PROMPT = (
     "Règles:\n"
     "1) Tu réponds uniquement en français.\n"
     "2) Tu ne corriges pas la grammaire/orthographe sauf si la commande est une commande de correction (cortex/coraud).\n"
-    "3) Pour une correction: commence par un compliment sincère (1 phrase), puis corrige doucement, puis un mini conseil positif.\n"
+    "3) Pour une correction: commence par 1 phrase positive, puis corrige doucement, puis donne 1–2 phrases de feedback utile.\n"
     "4) Tu peux faire une suggestion douce parfois, mais pas systématiquement.\n"
     "5) Si c’est ambigu, pose UNE question simple.\n"
     "6) Ne mentionne pas de règles internes ni de métadonnées.\n"
@@ -151,7 +230,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 class RedactSecretsFilter(logging.Filter):
     _bot_token_pattern = re.compile(r"bot\d+:[A-Za-z0-9_-]{20,}")
-
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             msg = record.getMessage()
@@ -175,7 +253,7 @@ telegram_app: Optional[Application] = None
 
 
 # =========================================================
-# Command specs
+# Commands
 # =========================================================
 @dataclass(frozen=True)
 class CommandSpec:
@@ -185,26 +263,26 @@ class CommandSpec:
     requires_reply: bool = True
 
 COMMANDS: Dict[str, CommandSpec] = {
-    "reptex":    CommandSpec(mode="rep", output="texte", private=False),
-    "repaud":    CommandSpec(mode="rep", output="audio", private=False),
-    "cortex":    CommandSpec(mode="cor", output="texte", private=False),
-    "coraud":    CommandSpec(mode="cor", output="audio", private=False),
-    "sumtex":    CommandSpec(mode="sum", output="texte", private=False),
-    "sumaud":    CommandSpec(mode="sum", output="audio", private=False),
-    "exttex":    CommandSpec(mode="ext", output="texte", private=False),
-    "reftex":    CommandSpec(mode="ref", output="texte", private=False),
-    "refaud":    CommandSpec(mode="ref", output="audio", private=False),
-    "aide":      CommandSpec(mode="help", output="texte", private=False, requires_reply=False),
-    "alya":      CommandSpec(mode="who", output="texte", private=False, requires_reply=False),
+    "reptex":  CommandSpec(mode="rep", output="texte", private=False),
+    "repaud":  CommandSpec(mode="rep", output="audio", private=False),
+    "cortex":  CommandSpec(mode="cor", output="texte", private=False),
+    "coraud":  CommandSpec(mode="cor", output="audio", private=False),
+    "reftex":  CommandSpec(mode="ref", output="texte", private=False),
+    "refaud":  CommandSpec(mode="ref", output="audio", private=False),
+    "sumtex":  CommandSpec(mode="sum", output="texte", private=False),
+    "sumaud":  CommandSpec(mode="sum", output="audio", private=False),
+    "exttex":  CommandSpec(mode="ext", output="texte", private=False),
+    "aide":    CommandSpec(mode="help", output="texte", private=False, requires_reply=False),
+    "alya":    CommandSpec(mode="who", output="texte", private=False, requires_reply=False),
 
-    # Optional private variants (kept)
-    "preptex":   CommandSpec(mode="rep", output="texte", private=True),
-    "prepaud":   CommandSpec(mode="rep", output="audio", private=True),
-    "pcortex":   CommandSpec(mode="cor", output="texte", private=True),
-    "pcoraud":   CommandSpec(mode="cor", output="audio", private=True),
+    # Optional private variants
+    "preptex": CommandSpec(mode="rep", output="texte", private=True),
+    "prepaud": CommandSpec(mode="rep", output="audio", private=True),
+    "pcortex": CommandSpec(mode="cor", output="texte", private=True),
+    "pcoraud": CommandSpec(mode="cor", output="audio", private=True),
 }
 
-# /aide WITHOUT cooldown/audio-limit lines (as requested)
+# /aide WITHOUT cooldown/audio limit lines (as requested)
 HELP_TEXT_FR = (
     "📌 Commandes (à utiliser en réponse à un message)\n\n"
     "• /reptex  : répondre naturellement (sans corriger) → texte\n"
@@ -305,7 +383,7 @@ def infer_audio_format_hint(msg: Message) -> Optional[str]:
 
 
 # =========================================================
-# Telegram + file handling
+# Telegram + audio handling
 # =========================================================
 async def download_file_bytes(context: ContextTypes.DEFAULT_TYPE, file_id: str) -> bytes:
     tg_file = await context.bot.get_file(file_id)
@@ -458,7 +536,6 @@ async def handle_identity_questions(update: Update, context: ContextTypes.DEFAUL
     if not msg or not msg.text:
         return
 
-    # Only if the asker is authorized
     if not await user_can_use_commands(update, context):
         return
 
@@ -546,7 +623,7 @@ def prompt_cor(combined_input: str) -> str:
         "Tu vas corriger le contenu ci-dessous en français. "
         "IMPORTANT: commence par 1 phrase positive (compliment sincère). "
         "Ensuite, donne la version corrigée (sans changer le style). "
-        "Enfin, ajoute 1–2 phrases de feedback bienveillant (si c'est un audio, tu peux commenter la prononciation/rythme). "
+        "Enfin, ajoute 1–2 phrases de feedback bienveillant (si c'est un audio, tu peux commenter prononciation/rythme). "
         "Reste doux/douce et encourageant(e).\n\n"
         f"{combined_input}"
     )
@@ -684,29 +761,17 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
 
 
 # =========================================================
-# Cooldown helpers (below uses monotonic clock)
-# =========================================================
-def cooldown_remaining(chat_id: int, user_id: int) -> float:
-    now = time.monotonic()
-    last = _last_call_ts.get((chat_id, user_id), 0.0)
-    return max(0.0, (last + COOLDOWN_SECONDS) - now)
-
-def mark_called(chat_id: int, user_id: int) -> None:
-    _last_call_ts[(chat_id, user_id)] = time.monotonic()
-
-
-# =========================================================
 # Command wrappers
 # =========================================================
 async def cmd_reptex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "reptex")
 async def cmd_repaud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "repaud")
 async def cmd_cortex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "cortex")
 async def cmd_coraud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "coraud")
+async def cmd_reftex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "reftex")
+async def cmd_refaud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "refaud")
 async def cmd_sumtex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "sumtex")
 async def cmd_sumaud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "sumaud")
 async def cmd_exttex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "exttex")
-async def cmd_reftex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "reftex")
-async def cmd_refaud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "refaud")
 async def cmd_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "aide")
 async def cmd_alya(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "alya")
 
@@ -765,11 +830,11 @@ async def on_startup():
     telegram_app.add_handler(CommandHandler("repaud", cmd_repaud))
     telegram_app.add_handler(CommandHandler("cortex", cmd_cortex))
     telegram_app.add_handler(CommandHandler("coraud", cmd_coraud))
+    telegram_app.add_handler(CommandHandler("reftex", cmd_reftex))
+    telegram_app.add_handler(CommandHandler("refaud", cmd_refaud))
     telegram_app.add_handler(CommandHandler("sumtex", cmd_sumtex))
     telegram_app.add_handler(CommandHandler("sumaud", cmd_sumaud))
     telegram_app.add_handler(CommandHandler("exttex", cmd_exttex))
-    telegram_app.add_handler(CommandHandler("reftex", cmd_reftex))
-    telegram_app.add_handler(CommandHandler("refaud", cmd_refaud))
     telegram_app.add_handler(CommandHandler("aide", cmd_aide))
     telegram_app.add_handler(CommandHandler("alya", cmd_alya))
 
