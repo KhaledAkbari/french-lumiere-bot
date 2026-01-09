@@ -29,6 +29,12 @@ Alya responds only if the command sender is authorized:
 - WHITELIST_USER_IDS OR
 - ALLOW_ALL_MEMBERS=True
 
+IMPORTANT: Privacy Mode
+-----------------------
+If you disable privacy mode in BotFather (/setprivacy -> Disable),
+the bot receives all group messages, which enables the ephemeral message cache
+used to reconstruct reply chains reliably for /con*.
+
 COMMANDS (use as a reply to a message)
 --------------------------------------
 /reptex   : natural helpful reply (no grammar correction) -> text
@@ -40,22 +46,25 @@ COMMANDS (use as a reply to a message)
 /sumtex   : summarize target message -> text
 /sumaud   : summarize target message -> voice note
 /exttex   : transcribe target audio/voice -> text
-/aide     : show commands (does NOT show /con* nor admin-only commands)
+/aide     : show commands (does NOT show /con* nor hidden commands)
 /alya     : identity
 
 CONTEXT-AWARE (THREAD) COMMANDS (HIDDEN)
 ---------------------------------------
 /contex and /conaud answer using ONLY the current reply-chain (thread) context.
-Important:
-- Context is NOT stored. It is collected on-the-fly ONLY when /con* is used.
-- If there is no reply chain, /con* falls back to normal single-message behavior.
-- Thread context input is capped to ~THREAD_MAX_INPUT_TOKENS (approximation via char budget).
-- For /con*, the thread includes ALL participants in the reply chain (no filtering).
+- Context is NOT stored on disk. It is ephemeral in-memory only.
+- Thread is collected on-the-fly ONLY when /con* is used.
+- If reply metadata is missing in the command update (common), the bot reconstructs
+  the chain from an ephemeral in-memory message index (requires privacy OFF).
+- Thread context input is capped to ~THREAD_MAX_INPUT_TOKENS (approx via char budget).
+- Thread includes ALL participants in the reply chain (no filtering).
 - Adds speaker prefixes (e.g., "Khaled: ...", "Alya: ...") to preserve who said what.
 
 DEBUG (HIDDEN)
 --------------
-/pdebtex : reply to a message, and Alya will DM you the exact thread turns captured for /con*
+/pdebtex : reply to a message, and Alya will DM you:
+- chain extracted from the update payload
+- chain reconstructed from cache
 (Not shown in /aide.)
 
 ADMIN-ONLY PRIVATE COMMANDS (HIDDEN)
@@ -90,6 +99,7 @@ Recommended:
 - WEBHOOK_SECRET_TOKEN
 Optional:
 - OPENAI_MODEL, TTS_MODEL, TTS_VOICE, TTS_SPEED, WEBHOOK_BASE_URL
+- THREAD_MAX_CONTEXT_CHARS, THREAD_MAX_HOPS, THREAD_CACHE_TTL_S
 Health:
 - GET /healthz -> healthy
 """
@@ -103,7 +113,7 @@ import random
 import logging
 import asyncio
 from dataclasses import dataclass
-from typing import Optional, Dict, Tuple, List
+from typing import Optional, Dict, Tuple, List, Any
 
 from fastapi import FastAPI, Request, Header, HTTPException, Response
 from fastapi.responses import PlainTextResponse
@@ -139,12 +149,17 @@ COOLDOWN_APPLIES_TO = {
 THREAD_MAX_INPUT_TOKENS = 300
 # Heuristic: ~4 chars/token → 300 tokens ≈ 1200 chars total context.
 THREAD_MAX_CONTEXT_CHARS = int(os.getenv("THREAD_MAX_CONTEXT_CHARS", "1200"))
-THREAD_MAX_HOPS = int(os.getenv("THREAD_MAX_HOPS", "10"))
+THREAD_MAX_HOPS = int(os.getenv("THREAD_MAX_HOPS", "12"))
 
 # Per-message caps inside the thread context
 # Bot messages are compressed more (lists are expensive); user messages can be longer.
 THREAD_MAX_CHARS_BOT = int(os.getenv("THREAD_MAX_CHARS_BOT", "260"))
 THREAD_MAX_CHARS_USER = int(os.getenv("THREAD_MAX_CHARS_USER", "450"))
+
+# Ephemeral thread cache (in-memory only; clears on restart)
+THREAD_CACHE_TTL_S = int(os.getenv("THREAD_CACHE_TTL_S", str(60 * 60)))  # 60 minutes
+THREAD_CACHE_MAX_MSG = int(os.getenv("THREAD_CACHE_MAX_MSG", "4000"))    # safety cap
+THREAD_CACHE_MAX_TURNS = int(os.getenv("THREAD_CACHE_MAX_TURNS", "12"))  # reconstruction depth
 
 # Audio input guard
 MAX_AUDIO_SECONDS_ABSOLUTE = 180.0
@@ -266,6 +281,98 @@ telegram_app: Optional[Application] = None
 
 
 # =========================================================
+# Ephemeral thread cache (in-memory only)
+# Key: (chat_id, message_id) -> {ts, sender_id, sender_name, text, reply_to_id, is_bot}
+# =========================================================
+
+_THREAD_CACHE: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+def _cache_key(chat_id: int, message_id: int) -> Tuple[int, int]:
+    return (chat_id, message_id)
+
+def _cache_cleanup() -> None:
+    cutoff = time.time() - THREAD_CACHE_TTL_S
+    to_del = [k for k, v in _THREAD_CACHE.items() if v.get("ts", 0) < cutoff]
+    for k in to_del:
+        _THREAD_CACHE.pop(k, None)
+
+    # hard cap: drop oldest
+    if len(_THREAD_CACHE) > THREAD_CACHE_MAX_MSG:
+        items = sorted(_THREAD_CACHE.items(), key=lambda kv: kv[1].get("ts", 0))
+        for k, _ in items[: len(_THREAD_CACHE) - THREAD_CACHE_MAX_MSG]:
+            _THREAD_CACHE.pop(k, None)
+
+def cache_message_update(update: Update) -> None:
+    """
+    Cache messages to reconstruct reply chains when nested reply objects are missing.
+    Requires privacy mode OFF to see all group messages.
+    """
+    chat = update.effective_chat
+    msg = update.effective_message
+    user = update.effective_user
+
+    if not chat or not msg or not user:
+        return
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    if (chat.title or "").strip() not in GROUP_NAMES:
+        return
+
+    text = (msg.text or msg.caption or "").strip()
+    # Cache even if empty text but it has a reply relation; but keep small.
+    reply_to_id = msg.reply_to_message.message_id if msg.reply_to_message else None
+    sender_name = (user.first_name or "Membre").strip()
+
+    _cache_cleanup()
+    _THREAD_CACHE[_cache_key(chat.id, msg.message_id)] = {
+        "ts": time.time(),
+        "sender_id": user.id,
+        "sender_name": sender_name,
+        "text": text[:450],
+        "reply_to_id": reply_to_id,
+        "is_bot": bool(user.is_bot),
+    }
+
+def reconstruct_chain_from_cache(chat_id: int, message_id: int, bot_id: int) -> List[Dict[str, str]]:
+    """
+    Rebuild a reply chain using cached reply_to_id pointers.
+    Includes ALL participants, with speaker prefix; role='assistant' only for bot.
+    """
+    _cache_cleanup()
+    turns: List[Dict[str, str]] = []
+    total_chars = 0
+    cur_id: Optional[int] = message_id
+
+    for _ in range(THREAD_CACHE_MAX_TURNS):
+        if not cur_id:
+            break
+        node = _THREAD_CACHE.get(_cache_key(chat_id, cur_id))
+        if not node:
+            break
+
+        sender_id = node.get("sender_id")
+        name = "Alya" if sender_id == bot_id else (node.get("sender_name") or "Membre")
+        txt = (node.get("text") or "").strip()
+
+        if txt:
+            cap = THREAD_MAX_CHARS_BOT if sender_id == bot_id else THREAD_MAX_CHARS_USER
+            txt = _truncate(txt, cap)
+            content = f"{name}: {txt}".strip()
+            role = "assistant" if sender_id == bot_id else "user"
+            turns.append({"role": role, "content": content})
+            total_chars += len(content)
+            if total_chars >= THREAD_MAX_CONTEXT_CHARS:
+                break
+
+        cur_id = node.get("reply_to_id")
+        if not cur_id:
+            break
+
+    turns.reverse()
+    return turns
+
+
+# =========================================================
 # Commands
 # =========================================================
 
@@ -375,9 +482,7 @@ async def user_can_use_commands(update: Update, context: ContextTypes.DEFAULT_TY
 
 def get_replied_message(update: Update) -> Optional[Message]:
     msg = update.effective_message
-    if not msg:
-        return None
-    return msg.reply_to_message
+    return msg.reply_to_message if msg else None
 
 def extract_text_from_message(msg: Message) -> str:
     return (msg.text or msg.caption or "").strip()
@@ -411,8 +516,7 @@ def infer_audio_format_hint(msg: Message) -> Optional[str]:
 
 
 # =========================================================
-# Thread-aware context: collect reply chain ON THE FLY (no storage)
-# Includes ALL participants (no filtering) + speaker prefixes
+# Thread-aware context: reply-chain collector (payload-based)
 # =========================================================
 
 def _truncate(s: str, n: int) -> str:
@@ -428,19 +532,16 @@ def _speaker_prefix(msg: Message, bot_user_id: int) -> str:
     name = (u.first_name or "Membre").strip()
     return f"{name}: "
 
-def collect_reply_chain_context_all(
+def collect_reply_chain_context_all_payload(
     start_msg: Optional[Message],
     bot_user_id: int,
     max_hops: int = THREAD_MAX_HOPS,
     max_total_chars: int = THREAD_MAX_CONTEXT_CHARS,
 ) -> List[Dict[str, str]]:
     """
-    Collect reply_to_message chain context (no storage).
-    Includes ALL participants in the chain.
-    - role='assistant' for Alya messages
-    - role='user' for everyone else
-    Adds short speaker prefixes.
-    Uses text/caption only (does not transcribe older audios).
+    Collect reply_to_message chain from the update payload (no storage).
+    Includes ALL participants. Adds speaker prefix.
+    Often fails if nested reply objects are missing -> use cache fallback.
     """
     turns: List[Dict[str, str]] = []
     total = 0
@@ -458,9 +559,7 @@ def collect_reply_chain_context_all(
             txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
             cap = THREAD_MAX_CHARS_BOT if u.id == bot_user_id else THREAD_MAX_CHARS_USER
             txt = _truncate(txt, cap)
-
-            pref = _speaker_prefix(cur, bot_user_id)
-            content = (pref + txt).strip()
+            content = (_speaker_prefix(cur, bot_user_id) + txt).strip()
 
             role = "assistant" if u.id == bot_user_id else "user"
             turns.append({"role": role, "content": content})
@@ -474,23 +573,39 @@ def collect_reply_chain_context_all(
     turns.reverse()
     return turns
 
-def format_thread_debug(chain_turns: List[Dict[str, str]], replied: Message, combined: str) -> str:
+def format_thread_debug(
+    chain_payload: List[Dict[str, str]],
+    chain_cache: List[Dict[str, str]],
+    replied: Message,
+    combined: str,
+    chat_id: int
+) -> str:
+    def fmt_turns(label: str, turns: List[Dict[str, str]]) -> List[str]:
+        out = []
+        out.append(f"== {label} ==")
+        out.append(f"turns: {len(turns)}")
+        out.append(f"chars: {sum(len(t.get('content','')) for t in turns)}")
+        for i, t in enumerate(turns, 1):
+            role = t.get("role","?")
+            content = t.get("content","").replace("\n", " ")
+            if len(content) > 170:
+                content = content[:170] + "…"
+            out.append(f"{i:02d}) {role}: {content}")
+        out.append("")
+        return out
+
     lines = []
     lines.append("🧪 DEBUG /con* — contexte capturé")
+    lines.append(f"- chat_id: {chat_id}")
     lines.append(f"- message_id cible: {replied.message_id}")
-    lines.append(f"- reply_to_message_id: {replied.reply_to_message.message_id if replied.reply_to_message else None}")
-    lines.append(f"- turns capturés (sans message courant): {len(chain_turns)}")
-    total_chars = sum(len(t.get("content", "")) for t in chain_turns)
-    lines.append(f"- total chars (sans message courant): {total_chars}")
+    lines.append(f"- reply_to_message_id (dans payload): {replied.reply_to_message.message_id if replied.reply_to_message else None}")
     lines.append(f"- budget chars (≈ {THREAD_MAX_INPUT_TOKENS} tokens): {THREAD_MAX_CONTEXT_CHARS}")
+    lines.append(f"- cache entries (approx): {len(_THREAD_CACHE)}")
     lines.append("")
-    for i, t in enumerate(chain_turns, 1):
-        role = t.get("role", "?")
-        content = t.get("content", "").replace("\n", " ")
-        if len(content) > 180:
-            content = content[:180] + "…"
-        lines.append(f"{i:02d}) {role}: {content}")
-    lines.append("")
+
+    lines.extend(fmt_turns("PAYLOAD (reply chain depuis l'update)", chain_payload))
+    lines.extend(fmt_turns("CACHE (reconstruction)", chain_cache))
+
     c = combined.replace("\n", " ")
     if len(c) > 220:
         c = c[:220] + "…"
@@ -820,22 +935,24 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
                 return
 
             if spec.mode == "aprep":
-                msgs = messages_for_single(prompt_rap_analyze(combined))
-                result = await run_blocking(openai_chat, msgs)
+                result = await run_blocking(openai_chat, messages_for_single(prompt_rap_analyze(combined)))
                 await send_text_private_to_user(update, context, user.id, result)
                 return
 
         # Debug command: DM the captured thread turns for /con*
         if spec.mode == "pdeb":
-            # Admin-only: you asked for "my DM"
             if not caller_is_admin:
                 await send_notice_fr(update, "❌ Cette commande est réservée aux admins/créateurs.")
                 return
 
             bot_id = context.bot.id
+            chat_id = chat.id
+
             parent = replied.reply_to_message
-            chain_turns = collect_reply_chain_context_all(parent, bot_id)
-            dbg = format_thread_debug(chain_turns, replied, combined)
+            chain_payload = collect_reply_chain_context_all_payload(parent, bot_id) if parent else []
+            chain_cache = reconstruct_chain_from_cache(chat_id, replied.message_id, bot_id)
+
+            dbg = format_thread_debug(chain_payload, chain_cache, replied, combined, chat_id)
             await send_text_private_to_user(update, context, user.id, dbg)
             await send_notice_fr(update, "✅ Debug envoyé en DM.")
             return
@@ -852,13 +969,17 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
             await send_notice_fr(update, "⚠️ Le message ciblé ne contient ni texte ni audio exploitable.")
             return
 
-        # Strong /con*: include ALL participants in reply-chain + speaker prefixes
+        # Strong /con*: payload chain + cache fallback (privacy OFF recommended)
         if spec.mode == "con":
             bot_id = context.bot.id
+            chat_id = chat.id
 
-            # Collect chain from parent to avoid duplicating current message
             parent = replied.reply_to_message
-            chain_turns = collect_reply_chain_context_all(parent, bot_id)
+            chain_turns = collect_reply_chain_context_all_payload(parent, bot_id) if parent else []
+
+            # If payload lacks nested reply objects, fall back to cache reconstruction
+            if not chain_turns:
+                chain_turns = reconstruct_chain_from_cache(chat_id, replied.message_id, bot_id)
 
             # Append current message once with speaker prefix
             current_pref = _speaker_prefix(replied, bot_id)
@@ -890,10 +1011,20 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
 
         result = await run_blocking(openai_chat, messages_for_single(user_prompt))
 
-        if spec.output == "audio":
-            await send_voice_result_to_chat(update, context, replied, result, caller_is_admin)
+        # Private variants to original author (kept behavior)
+        if spec.private and replied.from_user:
+            member_id = replied.from_user.id
+            try:
+                await context.bot.send_message(chat_id=member_id, text=result, disable_web_page_preview=True)
+            except Forbidden:
+                await send_notice_fr(update, "⚠️ DM impossible. L’utilisateur doit d’abord démarrer le bot en privé.")
+            except Exception:
+                await send_notice_fr(update, "⚠️ Erreur lors de l’envoi du DM.")
         else:
-            await send_text_result_to_chat(update, context, replied, result)
+            if spec.output == "audio":
+                await send_voice_result_to_chat(update, context, replied, result, caller_is_admin)
+            else:
+                await send_text_result_to_chat(update, context, replied, result)
 
     except (RateLimitError, APITimeoutError):
         await send_notice_fr(update, "⚠️ Service surchargé ou expiré. Réessaie dans un instant.")
@@ -944,10 +1075,7 @@ async def healthz():
     return "healthy"
 
 @app.post(WEBHOOK_PATH)
-async def telegram_webhook(
-    request: Request,
-    x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
-):
+async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: Optional[str] = Header(default=None)):
     if WEBHOOK_SECRET_TOKEN and x_telegram_bot_api_secret_token != WEBHOOK_SECRET_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -971,8 +1099,13 @@ async def on_startup():
 
     telegram_app = Application.builder().token(BOT_TOKEN).build()
 
+    # Passive cache of all messages (requires privacy OFF to receive full group traffic)
+    telegram_app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, lambda u, c: cache_message_update(u)))
+
+    # Identity trigger
     telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_identity_questions))
 
+    # Commands
     telegram_app.add_handler(CommandHandler("reptex", cmd_reptex))
     telegram_app.add_handler(CommandHandler("repaud", cmd_repaud))
     telegram_app.add_handler(CommandHandler("cortex", cmd_cortex))
@@ -983,17 +1116,17 @@ async def on_startup():
     telegram_app.add_handler(CommandHandler("sumaud", cmd_sumaud))
     telegram_app.add_handler(CommandHandler("exttex", cmd_exttex))
 
-    # Thread-aware commands (NOT shown in /aide)
+    # Thread-aware (hidden from /aide)
     telegram_app.add_handler(CommandHandler("contex", cmd_contex))
     telegram_app.add_handler(CommandHandler("conaud", cmd_conaud))
 
-    # Debug command (hidden)
+    # Debug (hidden)
     telegram_app.add_handler(CommandHandler("pdebtex", cmd_pdebtex))
 
     telegram_app.add_handler(CommandHandler("aide", cmd_aide))
     telegram_app.add_handler(CommandHandler("alya", cmd_alya))
 
-    # Admin-only (hidden)
+    # Admin-only hidden
     telegram_app.add_handler(CommandHandler("apexttex", cmd_apexttex))
     telegram_app.add_handler(CommandHandler("apreptex", cmd_apreptex))
 
