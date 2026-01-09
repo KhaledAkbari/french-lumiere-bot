@@ -158,7 +158,7 @@ THREAD_MAX_CHARS_BOT = int(os.getenv("THREAD_MAX_CHARS_BOT", "260"))
 THREAD_MAX_CHARS_USER = int(os.getenv("THREAD_MAX_CHARS_USER", "450"))
 
 # Ephemeral cache (in-memory only; clears on restart)
-THREAD_CACHE_TTL_S = int(os.getenv("THREAD_CACHE_TTL_S", str(6 * 60 * 60)))  # default 6 hours
+THREAD_CACHE_TTL_S = int(os.getenv("THREAD_CACHE_TTL_S", str(24 * 60 * 60)))  # default 6 hours
 THREAD_CACHE_MAX_MSG = int(os.getenv("THREAD_CACHE_MAX_MSG", "8000"))
 THREAD_CACHE_MAX_TURNS = int(os.getenv("THREAD_CACHE_MAX_TURNS", "12"))
 
