@@ -49,8 +49,14 @@ CONTEXT-AWARE (THREAD) COMMANDS (HIDDEN)
 Important:
 - Context is NOT stored. It is collected on-the-fly ONLY when /con* is used.
 - If there is no reply chain, /con* falls back to normal single-message behavior.
-- Thread context input is capped to ~THREAD_MAX_INPUT_TOKENS (approximation).
+- Thread context input is capped to ~THREAD_MAX_INPUT_TOKENS (approximation via char budget).
 - For /con*, the thread includes ALL participants in the reply chain (no filtering).
+- Adds speaker prefixes (e.g., "Khaled: ...", "Alya: ...") to preserve who said what.
+
+DEBUG (HIDDEN)
+--------------
+/pdebtex : reply to a message, and Alya will DM you the exact thread turns captured for /con*
+(Not shown in /aide.)
 
 ADMIN-ONLY PRIVATE COMMANDS (HIDDEN)
 -----------------------------------
@@ -124,16 +130,19 @@ COOLDOWN_SECONDS = 5.0
 COOLDOWN_APPLIES_TO = {
     "reptex", "repaud", "cortex", "coraud",
     "reftex", "refaud", "sumtex", "sumaud", "exttex",
-    "contex", "conaud", "apexttex", "apreptex",
+    "contex", "conaud",
+    "apexttex", "apreptex",
+    "pdebtex",
 }
 
 # Thread context budget (approx). We don't tokenize here; we enforce via char caps.
-THREAD_MAX_INPUT_TOKENS = 400
+THREAD_MAX_INPUT_TOKENS = 300
 # Heuristic: ~4 chars/token → 300 tokens ≈ 1200 chars total context.
 THREAD_MAX_CONTEXT_CHARS = int(os.getenv("THREAD_MAX_CONTEXT_CHARS", "1200"))
 THREAD_MAX_HOPS = int(os.getenv("THREAD_MAX_HOPS", "10"))
-THREAD_MAX_CHARS_EACH = int(os.getenv("THREAD_MAX_CHARS_EACH", "450"))
-# To keep topic in the budget, we compress long bot messages slightly more:
+
+# Per-message caps inside the thread context
+# Bot messages are compressed more (lists are expensive); user messages can be longer.
 THREAD_MAX_CHARS_BOT = int(os.getenv("THREAD_MAX_CHARS_BOT", "260"))
 THREAD_MAX_CHARS_USER = int(os.getenv("THREAD_MAX_CHARS_USER", "450"))
 
@@ -251,6 +260,7 @@ logger.addFilter(RedactSecretsFilter())
 # =========================================================
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY, max_retries=0, timeout=30)
+
 app = FastAPI(title="FrenchLumiereAlyaBot")
 telegram_app: Optional[Application] = None
 
@@ -261,7 +271,7 @@ telegram_app: Optional[Application] = None
 
 @dataclass(frozen=True)
 class CommandSpec:
-    mode: str          # rep/cor/ref/sum/ext/con/help/who/apex/aprep
+    mode: str          # rep/cor/ref/sum/ext/con/help/who/apex/aprep/pdeb
     output: str        # texte/audio
     private: bool
     requires_reply: bool = True
@@ -281,6 +291,9 @@ COMMANDS: Dict[str, CommandSpec] = {
     "contex":  CommandSpec(mode="con", output="texte", private=False),
     "conaud":  CommandSpec(mode="con", output="audio", private=False),
 
+    # Debug thread capture (HIDDEN from /aide)
+    "pdebtex": CommandSpec(mode="pdeb", output="texte", private=True),
+
     "aide":    CommandSpec(mode="help", output="texte", private=False, requires_reply=False),
     "alya":    CommandSpec(mode="who", output="texte", private=False, requires_reply=False),
 
@@ -295,7 +308,7 @@ COMMANDS: Dict[str, CommandSpec] = {
     "apreptex": CommandSpec(mode="aprep", output="texte", private=True),
 }
 
-# /aide does NOT include /con* nor admin-only commands
+# /aide does NOT include /con*, /pdebtex nor admin-only commands
 HELP_TEXT_FR = (
     "📌 *Commandes (à utiliser en réponse à un message)*\n\n"
     "• /reptex : répondre naturellement (texte + audio si présent) → *texte*\n"
@@ -362,7 +375,9 @@ async def user_can_use_commands(update: Update, context: ContextTypes.DEFAULT_TY
 
 def get_replied_message(update: Update) -> Optional[Message]:
     msg = update.effective_message
-    return msg.reply_to_message if msg else None
+    if not msg:
+        return None
+    return msg.reply_to_message
 
 def extract_text_from_message(msg: Message) -> str:
     return (msg.text or msg.caption or "").strip()
@@ -396,7 +411,8 @@ def infer_audio_format_hint(msg: Message) -> Optional[str]:
 
 
 # =========================================================
-# Thread-aware context (stronger /con*): reply-chain collector (ALL participants)
+# Thread-aware context: collect reply chain ON THE FLY (no storage)
+# Includes ALL participants (no filtering) + speaker prefixes
 # =========================================================
 
 def _truncate(s: str, n: int) -> str:
@@ -409,7 +425,6 @@ def _speaker_prefix(msg: Message, bot_user_id: int) -> str:
         return ""
     if u.id == bot_user_id:
         return "Alya: "
-    # Use first_name only to reduce tokens; fallback to "Membre"
     name = (u.first_name or "Membre").strip()
     return f"{name}: "
 
@@ -424,7 +439,7 @@ def collect_reply_chain_context_all(
     Includes ALL participants in the chain.
     - role='assistant' for Alya messages
     - role='user' for everyone else
-    Adds a short speaker prefix to preserve who said what.
+    Adds short speaker prefixes.
     Uses text/caption only (does not transcribe older audios).
     """
     turns: List[Dict[str, str]] = []
@@ -458,6 +473,29 @@ def collect_reply_chain_context_all(
 
     turns.reverse()
     return turns
+
+def format_thread_debug(chain_turns: List[Dict[str, str]], replied: Message, combined: str) -> str:
+    lines = []
+    lines.append("🧪 DEBUG /con* — contexte capturé")
+    lines.append(f"- message_id cible: {replied.message_id}")
+    lines.append(f"- reply_to_message_id: {replied.reply_to_message.message_id if replied.reply_to_message else None}")
+    lines.append(f"- turns capturés (sans message courant): {len(chain_turns)}")
+    total_chars = sum(len(t.get("content", "")) for t in chain_turns)
+    lines.append(f"- total chars (sans message courant): {total_chars}")
+    lines.append(f"- budget chars (≈ {THREAD_MAX_INPUT_TOKENS} tokens): {THREAD_MAX_CONTEXT_CHARS}")
+    lines.append("")
+    for i, t in enumerate(chain_turns, 1):
+        role = t.get("role", "?")
+        content = t.get("content", "").replace("\n", " ")
+        if len(content) > 180:
+            content = content[:180] + "…"
+        lines.append(f"{i:02d}) {role}: {content}")
+    lines.append("")
+    c = combined.replace("\n", " ")
+    if len(c) > 220:
+        c = c[:220] + "…"
+    lines.append(f"MSG COURANT (combined): {c}")
+    return "\n".join(lines)
 
 
 # =========================================================
@@ -645,17 +683,14 @@ async def handle_identity_questions(update: Update, context: ContextTypes.DEFAUL
 # =========================================================
 
 def messages_for_single(user_prompt: str) -> List[Dict[str, str]]:
-    return [
-        {"role": "system", "content": BEHAVIOR_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
+    return [{"role": "system", "content": BEHAVIOR_PROMPT}, {"role": "user", "content": user_prompt}]
 
 def prompt_rep(combined_input: str) -> str:
     add_suggestion = (random.random() < 0.30)
     suggestion_line = ("\n\nOptionnel: une suggestion douce (1 phrase)." if add_suggestion else "")
     return (
         "Réponds naturellement au message ci-dessous, en français. "
-        "Sois amical(e), coopératif(ve), simple et clair. "
+        "Sois amical(e), simple et clair. "
         "Ne corrige pas la grammaire/orthographe."
         f"{suggestion_line}\n\n{combined_input}"
     )
@@ -718,9 +753,7 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
 
     # Auto-delete command message
     if update.effective_message:
-        asyncio.create_task(
-            delete_command_message_later(context, chat.id, update.effective_message.message_id, COMMAND_DELETE_DELAY_S)
-        )
+        asyncio.create_task(delete_command_message_later(context, chat.id, update.effective_message.message_id, COMMAND_DELETE_DELAY_S))
 
     # Only authorized users trigger responses
     if not await user_can_use_commands(update, context):
@@ -781,7 +814,7 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
 
             if spec.mode == "apex":
                 if not transcript:
-                    await send_notice_fr(update, "⚠️ /apexttex nécessite un message vocal ou audio.")
+                    await send_notice_fr(update, "⚠️ /apexttex nécessite un audio.")
                     return
                 await send_text_private_to_user(update, context, user.id, transcript.strip())
                 return
@@ -792,10 +825,25 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
                 await send_text_private_to_user(update, context, user.id, result)
                 return
 
+        # Debug command: DM the captured thread turns for /con*
+        if spec.mode == "pdeb":
+            # Admin-only: you asked for "my DM"
+            if not caller_is_admin:
+                await send_notice_fr(update, "❌ Cette commande est réservée aux admins/créateurs.")
+                return
+
+            bot_id = context.bot.id
+            parent = replied.reply_to_message
+            chain_turns = collect_reply_chain_context_all(parent, bot_id)
+            dbg = format_thread_debug(chain_turns, replied, combined)
+            await send_text_private_to_user(update, context, user.id, dbg)
+            await send_notice_fr(update, "✅ Debug envoyé en DM.")
+            return
+
         # Public extraction
         if spec.mode == "ext":
             if not transcript:
-                await send_notice_fr(update, "⚠️ /exttex nécessite un message vocal ou audio.")
+                await send_notice_fr(update, "⚠️ /exttex nécessite un audio.")
                 return
             await send_text_result_to_chat(update, context, replied, transcript.strip())
             return
@@ -804,7 +852,7 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
             await send_notice_fr(update, "⚠️ Le message ciblé ne contient ni texte ni audio exploitable.")
             return
 
-        # Stronger /con*: include ALL participants in the reply-chain (no filtering)
+        # Strong /con*: include ALL participants in reply-chain + speaker prefixes
         if spec.mode == "con":
             bot_id = context.bot.id
 
@@ -812,9 +860,9 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
             parent = replied.reply_to_message
             chain_turns = collect_reply_chain_context_all(parent, bot_id)
 
-            # Append current message once (with speaker prefix)
+            # Append current message once with speaker prefix
             current_pref = _speaker_prefix(replied, bot_id)
-            chain_turns.append({"role": "user", "content": _truncate(current_pref + combined, THREAD_MAX_CHARS_EACH)})
+            chain_turns.append({"role": "user", "content": _truncate(current_pref + combined, THREAD_MAX_CHARS_USER)})
 
             msgs = [{"role": "system", "content": BEHAVIOR_PROMPT}] + chain_turns + [
                 {"role": "user", "content": prompt_con()}
@@ -840,23 +888,12 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
             await send_notice_fr(update, "⚠️ Mode de commande inconnu.")
             return
 
-        msgs = messages_for_single(user_prompt)
-        result = await run_blocking(openai_chat, msgs)
+        result = await run_blocking(openai_chat, messages_for_single(user_prompt))
 
-        # Private variants to original author
-        member_id = replied.from_user.id
-        if spec.private:
-            try:
-                await context.bot.send_message(chat_id=member_id, text=result, disable_web_page_preview=True)
-            except Forbidden:
-                await send_notice_fr(update, "⚠️ DM impossible. L’utilisateur doit d’abord démarrer le bot en privé.")
-            except Exception:
-                await send_notice_fr(update, "⚠️ Erreur lors de l’envoi du DM.")
+        if spec.output == "audio":
+            await send_voice_result_to_chat(update, context, replied, result, caller_is_admin)
         else:
-            if spec.output == "audio":
-                await send_voice_result_to_chat(update, context, replied, result, caller_is_admin)
-            else:
-                await send_text_result_to_chat(update, context, replied, result)
+            await send_text_result_to_chat(update, context, replied, result)
 
     except (RateLimitError, APITimeoutError):
         await send_notice_fr(update, "⚠️ Service surchargé ou expiré. Réessaie dans un instant.")
@@ -887,6 +924,7 @@ async def cmd_sumaud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await
 async def cmd_exttex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "exttex")
 async def cmd_contex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "contex")
 async def cmd_conaud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "conaud")
+async def cmd_pdebtex(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "pdebtex")
 async def cmd_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "aide")
 async def cmd_alya(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "alya")
 async def cmd_apexttex(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "apexttex")
@@ -916,11 +954,7 @@ async def telegram_webhook(
     if telegram_app is None:
         raise HTTPException(status_code=503, detail="Bot not ready")
 
-    try:
-        data = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
+    data = await request.json()
     update = Update.de_json(data, telegram_app.bot)
     await telegram_app.process_update(update)
     return {"ok": True}
@@ -952,6 +986,9 @@ async def on_startup():
     # Thread-aware commands (NOT shown in /aide)
     telegram_app.add_handler(CommandHandler("contex", cmd_contex))
     telegram_app.add_handler(CommandHandler("conaud", cmd_conaud))
+
+    # Debug command (hidden)
+    telegram_app.add_handler(CommandHandler("pdebtex", cmd_pdebtex))
 
     telegram_app.add_handler(CommandHandler("aide", cmd_aide))
     telegram_app.add_handler(CommandHandler("alya", cmd_alya))
