@@ -1,5 +1,4 @@
 
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -72,6 +71,11 @@ ADMIN-ONLY PRIVATE COMMANDS (HIDDEN)
 /apexttex : extract text from audio and send privately to the admin who triggered it
 /apreptex : analyze rap text/audio and send privately to the admin who triggered it
 
+ADMIN-ONLY CACHE TOOLS (HIDDEN)
+-------------------------------
+/cacheinfo   : DM cache size, TTL, sample items, metrics
+/diagprivacy : DM quick privacy effectiveness check (recent cached non-command messages)
+
 BEHAVIOR / COST
 ---------------
 - Output is capped to MAX_OUTPUT_TOKENS (default 200).
@@ -99,6 +103,7 @@ Recommended:
 Optional:
 - OPENAI_MODEL, TTS_MODEL, TTS_VOICE, TTS_SPEED, WEBHOOK_BASE_URL
 - THREAD_MAX_CONTEXT_CHARS, THREAD_MAX_HOPS, THREAD_CACHE_TTL_S, THREAD_CACHE_MAX_MSG
+- THREAD_SAFE_FALLBACK=1 (default 1)
 Health:
 - GET /healthz -> healthy
 """
@@ -156,6 +161,9 @@ THREAD_MAX_CHARS_USER = int(os.getenv("THREAD_MAX_CHARS_USER", "450"))
 THREAD_CACHE_TTL_S = int(os.getenv("THREAD_CACHE_TTL_S", str(6 * 60 * 60)))  # default 6 hours
 THREAD_CACHE_MAX_MSG = int(os.getenv("THREAD_CACHE_MAX_MSG", "8000"))
 THREAD_CACHE_MAX_TURNS = int(os.getenv("THREAD_CACHE_MAX_TURNS", "12"))
+
+# Minimal safe fallback when thread is missing (1=on, 0=off)
+THREAD_SAFE_FALLBACK = (os.getenv("THREAD_SAFE_FALLBACK", "1").strip() == "1")
 
 # 🎙 Audio input guard
 MAX_AUDIO_SECONDS_ABSOLUTE = 180.0
@@ -284,7 +292,7 @@ telegram_app: Optional[Application] = None
 
 @dataclass(frozen=True)
 class CommandSpec:
-    mode: str          # rep/cor/ref/sum/ext/con/help/who/apex/aprep/pdeb
+    mode: str          # rep/cor/ref/sum/ext/con/help/who/apex/aprep/pdeb/cacheinfo/diagprivacy
     output: str        # texte/audio
     private: bool
     requires_reply: bool = True
@@ -307,6 +315,10 @@ COMMANDS: Dict[str, CommandSpec] = {
     # Debug (hidden)
     "pdebtex": CommandSpec(mode="pdeb", output="texte", private=True),
 
+    # Admin cache tools (hidden)
+    "cacheinfo":   CommandSpec(mode="cacheinfo", output="texte", private=True, requires_reply=False),
+    "diagprivacy": CommandSpec(mode="diagprivacy", output="texte", private=True, requires_reply=False),
+
     "aide":    CommandSpec(mode="help", output="texte", private=False, requires_reply=False),
     "alya":    CommandSpec(mode="who", output="texte", private=False, requires_reply=False),
 
@@ -321,7 +333,7 @@ COMMANDS: Dict[str, CommandSpec] = {
     "apreptex": CommandSpec(mode="aprep", output="texte", private=True),
 }
 
-# /aide excludes /con*, /pdebtex and admin-only commands
+# /aide excludes /con*, /pdebtex, /cacheinfo, /diagprivacy and admin-only commands
 HELP_TEXT_FR = (
     "📌 *Commandes (à utiliser en réponse à un message)*\n\n"
     "• /reptex : répondre naturellement (texte + audio si présent) → *texte*\n"
@@ -427,6 +439,18 @@ def infer_audio_format_hint(msg: Message) -> Optional[str]:
 
 _THREAD_CACHE: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
+# Simple metrics to validate thread capture behavior
+METRICS: Dict[str, int] = {
+    "con_calls": 0,
+    "payload_chain_nonzero": 0,
+    "payload_chain_zero": 0,
+    "cache_hits": 0,
+    "cache_entries": 0,
+}
+
+def _metrics_refresh() -> None:
+    METRICS["cache_entries"] = len(_THREAD_CACHE)
+
 def _cache_key(chat_id: int, message_id: int) -> Tuple[int, int]:
     return (chat_id, message_id)
 
@@ -440,6 +464,7 @@ def _cache_cleanup() -> None:
         items = sorted(_THREAD_CACHE.items(), key=lambda kv: kv[1].get("ts", 0))
         for k, _ in items[: len(_THREAD_CACHE) - THREAD_CACHE_MAX_MSG]:
             _THREAD_CACHE.pop(k, None)
+    _metrics_refresh()
 
 def _truncate(s: str, n: int) -> str:
     s = (s or "").strip()
@@ -460,7 +485,9 @@ def cache_message_update(update: Update) -> None:
 
     text = (msg.text or msg.caption or "").strip()
     reply_to_id = msg.reply_to_message.message_id if msg.reply_to_message else None
-    sender_name = (user.first_name or "Membre").strip()
+
+    # Better display name (first + last when available)
+    sender_name = ((user.first_name or "") + " " + (user.last_name or "")).strip() or (user.username or "Membre")
 
     _cache_cleanup()
     _THREAD_CACHE[_cache_key(chat.id, msg.message_id)] = {
@@ -471,6 +498,11 @@ def cache_message_update(update: Update) -> None:
         "reply_to_id": reply_to_id,
         "is_bot": bool(user.is_bot),
     }
+
+    # Light instrumentation (helps confirm privacy mode effectiveness)
+    logger.info("cache:add chat=%s msg=%s reply_to=%s text_len=%s",
+                chat.id, msg.message_id, reply_to_id, len(text))
+    _metrics_refresh()
 
 def cache_outgoing(chat_id: int, bot_id: int, message_id: int, reply_to_id: Optional[int], text: str) -> None:
     """Cache Alya outgoing messages explicitly (bots often don't receive their own updates)."""
@@ -483,6 +515,7 @@ def cache_outgoing(chat_id: int, bot_id: int, message_id: int, reply_to_id: Opti
         "reply_to_id": reply_to_id,
         "is_bot": True,
     }
+    _metrics_refresh()
 
 def reconstruct_chain_from_cache(chat_id: int, message_id: int, bot_id: int) -> List[Dict[str, str]]:
     """Reconstruct reply chain using cached reply_to_id pointers."""
@@ -518,6 +551,8 @@ def reconstruct_chain_from_cache(chat_id: int, message_id: int, bot_id: int) -> 
             break
 
     turns.reverse()
+    if turns:
+        METRICS["cache_hits"] += 1
     return turns
 
 async def cache_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -534,7 +569,7 @@ def _speaker_prefix_from_user(u, bot_user_id: int) -> str:
         return ""
     if u.id == bot_user_id:
         return "Alya: "
-    name = (u.first_name or "Membre").strip()
+    name = ((u.first_name or "") + " " + (u.last_name or "")).strip() or (u.username or "Membre")
     return f"{name}: "
 
 def collect_reply_chain_context_payload(start_msg: Optional[Message], bot_user_id: int) -> List[Dict[str, str]]:
@@ -565,6 +600,10 @@ def collect_reply_chain_context_payload(start_msg: Optional[Message], bot_user_i
         cur = cur.reply_to_message
 
     turns.reverse()
+    if turns:
+        METRICS["payload_chain_nonzero"] += 1
+    else:
+        METRICS["payload_chain_zero"] += 1
     return turns
 
 def format_thread_debug(chat_id: int, replied: Message, combined: str, payload_turns: List[Dict[str, str]], cache_turns: List[Dict[str, str]]) -> str:
@@ -709,7 +748,6 @@ async def send_text_result_to_chat(update: Update, context: ContextTypes.DEFAULT
         reply_to_message_id=replied.message_id,
         disable_web_page_preview=True,
     )
-    # Cache Alya outgoing message so cache reconstruction can traverse through Alya replies
     cache_outgoing(update.effective_chat.id, context.bot.id, sent.message_id, replied.message_id, text_fr)
 
 async def send_voice_result_to_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, replied: Message, text_fr: str, caller_is_admin: bool):
@@ -728,7 +766,6 @@ async def send_voice_result_to_chat(update: Update, context: ContextTypes.DEFAUL
         voice=voice_file,
         reply_to_message_id=replied.message_id,
     )
-    # Cache Alya outgoing voice note as text reference
     cache_outgoing(update.effective_chat.id, context.bot.id, sent.message_id, replied.message_id, f"(vocal) {text_fr}")
 
 
@@ -881,7 +918,7 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
         await send_notice_fr(update, get_identity_text())
         return
 
-    # Cooldown
+    # Cooldown (skip admin cache tools)
     if cmd_name in COOLDOWN_APPLIES_TO:
         rem = cooldown_remaining(chat.id, user.id)
         if rem > 0:
@@ -889,24 +926,59 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
             return
         mark_called(chat.id, user.id)
 
-    replied = get_replied_message(update)
-    if spec.requires_reply and not replied:
-        await send_notice_fr(update, "⚠️ Réponds à un message, puis utilise la commande.")
-        return
-    if not replied or not replied.from_user:
-        await send_notice_fr(update, "⚠️ Impossible d’identifier le message ciblé.")
-        return
-
     caller_is_admin = await is_admin_or_creator(update, context)
 
-    # Audio input guard
-    dur = audio_duration_seconds(replied)
-    if dur is not None:
-        if dur > MAX_AUDIO_SECONDS_ABSOLUTE:
-            await send_notice_fr(update, f"🎙️ Audio trop long ({dur:.0f}s). Maximum {MAX_AUDIO_SECONDS_ABSOLUTE:.0f}s.")
+    # Admin-only cache tools (DM only; no public ack)
+    if spec.mode in ("cacheinfo", "diagprivacy"):
+        if not caller_is_admin:
+            await send_notice_fr(update, "❌ Cette commande est réservée aux admins/créateurs.")
             return
-        if (not caller_is_admin) and dur > MAX_AUDIO_SECONDS_NON_ADMIN:
-            await send_notice_fr(update, f"🎙️ Audio trop long ({dur:.0f}s). Limite {MAX_AUDIO_SECONDS_NON_ADMIN:.0f}s (sauf admins).")
+
+        recent_cutoff = time.time() - 5 * 60  # last 5 minutes
+        recent = [(k, v) for k, v in _THREAD_CACHE.items() if v.get("ts", 0) >= recent_cutoff]
+        recent_noncmd = len(recent)
+        _metrics_refresh()
+
+        if spec.mode == "cacheinfo":
+            sample = sorted(_THREAD_CACHE.items(), key=lambda kv: kv[1].get("ts", 0), reverse=True)[:6]
+            lines = []
+            lines.append("📊 Cache info")
+            lines.append(f"- entries: {METRICS['cache_entries']}")
+            lines.append(f"- TTL (s): {THREAD_CACHE_TTL_S}")
+            lines.append(f"- max msgs: {THREAD_CACHE_MAX_MSG}")
+            lines.append(f"- recent (5 min): {recent_noncmd}")
+            lines.append(f"- payload_chain_nonzero: {METRICS['payload_chain_nonzero']}")
+            lines.append(f"- payload_chain_zero: {METRICS['payload_chain_zero']}")
+            lines.append(f"- cache_hits: {METRICS['cache_hits']}")
+            lines.append("")
+            for (ck, node) in sample:
+                lines.append(
+                    f"{time.strftime('%H:%M:%S', time.localtime(node.get('ts',0)))} "
+                    f"chat={ck[0]} msg={ck[1]} from={node.get('sender_name')} "
+                    f"reply_to={node.get('reply_to_id')} text=\"{_truncate(node.get('text',''), 100)}\""
+                )
+            await send_text_private_to_user(update, context, user.id, "\n".join(lines))
+            return
+
+        if spec.mode == "diagprivacy":
+            msg = (
+                "🔎 Diagnostic confidentialité\n"
+                f"• Messages non-commandes observés (5 min): {recent_noncmd}\n"
+                "• Interprétation: "
+                + ("✅ Privacy OFF (groupe livré au cache)" if recent_noncmd > 0 else "⚠️ Probable privacy ON (ou peu d'activité)")
+            )
+            await send_text_private_to_user(update, context, user.id, msg)
+            return
+
+    # From here: commands that may require a replied message
+    replied = get_replied_message(update)
+
+    if spec.requires_reply:
+        if not replied:
+            await send_notice_fr(update, "⚠️ Réponds à un message, puis utilise la commande.")
+            return
+        if not replied.from_user:
+            await send_notice_fr(update, "⚠️ Impossible d’identifier le message ciblé.")
             return
 
     error_id = uuid.uuid4().hex[:8]
@@ -916,9 +988,12 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
         action = ChatAction.RECORD_VOICE if spec.output == "audio" else ChatAction.TYPING
         action_task = asyncio.create_task(chat_action_loop(context, chat.id, action))
 
-        # Build input
-        text, transcript = await build_input_bundle(context, replied)
-        combined = combine_inputs(text, transcript)
+        # Build input (only for reply-based commands)
+        combined = ""
+        transcript = None
+        if replied:
+            text, transcript = await build_input_bundle(context, replied)
+            combined = combine_inputs(text, transcript)
 
         # Admin-only hidden
         if spec.mode in ("apex", "aprep"):
@@ -943,9 +1018,9 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
                 return
             bot_id = context.bot.id
             chat_id = chat.id
-            parent = replied.reply_to_message
+            parent = replied.reply_to_message if replied else None
             payload_turns = collect_reply_chain_context_payload(parent, bot_id) if parent else []
-            cache_turns = reconstruct_chain_from_cache(chat_id, replied.message_id, bot_id)
+            cache_turns = reconstruct_chain_from_cache(chat_id, replied.message_id, bot_id) if replied else []
             dbg = format_thread_debug(chat_id, replied, combined, payload_turns, cache_turns)
             await send_text_private_to_user(update, context, user.id, dbg)
             return
@@ -958,24 +1033,25 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
             await send_text_result_to_chat(update, context, replied, transcript.strip())
             return
 
-        if not combined:
+        if spec.mode != "con" and spec.mode not in ("help", "who") and replied and not combined:
             await send_notice_fr(update, "⚠️ Le message ciblé ne contient ni texte ni audio exploitable.")
             return
 
         # Thread-aware
         if spec.mode == "con":
+            METRICS["con_calls"] += 1
             bot_id = context.bot.id
             chat_id = chat.id
 
             # Best effort: payload chain from parent
-            parent = replied.reply_to_message
+            parent = replied.reply_to_message if replied else None
             chain_turns = collect_reply_chain_context_payload(parent, bot_id) if parent else []
 
-            # Fallback: reconstruct from cache starting at the replied message
-            if not chain_turns:
+            # Fallback: reconstruct from cache starting at replied message
+            if not chain_turns and replied:
                 chain_turns = reconstruct_chain_from_cache(chat_id, replied.message_id, bot_id)
 
-            # Ensure the last turn reflects the current combined content (avoid duplication)
+            # Ensure the last turn reflects the current combined content
             current_line = (_speaker_prefix_from_user(replied.from_user, bot_id) + combined).strip()
             current_line = _truncate(current_line, THREAD_MAX_CHARS_USER)
 
@@ -983,6 +1059,19 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
                 chain_turns[-1] = {"role": "user", "content": current_line}
             else:
                 chain_turns = [{"role": "user", "content": current_line}]
+
+            # Minimal safe fallback (no drift) when we have no prior context
+            only_current = (len(chain_turns) == 1)
+            if THREAD_SAFE_FALLBACK and only_current:
+                fallback_text = (
+                    "Je ne vois pas le fil de conversation.\n"
+                    "Peux-tu préciser en une phrase le contexte du message auquel tu réponds ?"
+                )
+                if spec.output == "audio":
+                    await send_voice_result_to_chat(update, context, replied, fallback_text, caller_is_admin)
+                else:
+                    await send_text_result_to_chat(update, context, replied, fallback_text)
+                return
 
             msgs = [{"role": "system", "content": BEHAVIOR_PROMPT}] + chain_turns + [
                 {"role": "user", "content": prompt_con()}
@@ -1043,20 +1132,22 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
 # Command wrappers
 # =========================================================
 
-async def cmd_reptex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "reptex")
-async def cmd_repaud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "repaud")
-async def cmd_cortex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "cortex")
-async def cmd_coraud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "coraud")
-async def cmd_reftex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "reftex")
-async def cmd_refaud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "refaud")
-async def cmd_sumtex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "sumtex")
-async def cmd_sumaud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "sumaud")
-async def cmd_exttex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "exttex")
-async def cmd_contex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "contex")
-async def cmd_conaud(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "conaud")
-async def cmd_pdebtex(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "pdebtex")
-async def cmd_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "aide")
-async def cmd_alya(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "alya")
+async def cmd_reptex(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "reptex")
+async def cmd_repaud(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "repaud")
+async def cmd_cortex(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "cortex")
+async def cmd_coraud(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "coraud")
+async def cmd_reftex(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "reftex")
+async def cmd_refaud(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "refaud")
+async def cmd_sumtex(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "sumtex")
+async def cmd_sumaud(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "sumaud")
+async def cmd_exttex(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "exttex")
+async def cmd_contex(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "contex")
+async def cmd_conaud(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "conaud")
+async def cmd_pdebtex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "pdebtex")
+async def cmd_cacheinfo(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "cacheinfo")
+async def cmd_diagprivacy(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "diagprivacy")
+async def cmd_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):     await handle_command(update, context, "aide")
+async def cmd_alya(update: Update, context: ContextTypes.DEFAULT_TYPE):     await handle_command(update, context, "alya")
 async def cmd_apexttex(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "apexttex")
 async def cmd_apreptex(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "apreptex")
 
@@ -1121,6 +1212,10 @@ async def on_startup():
 
     # Debug (hidden)
     telegram_app.add_handler(CommandHandler("pdebtex", cmd_pdebtex))
+
+    # Admin cache tools (hidden)
+    telegram_app.add_handler(CommandHandler("cacheinfo", cmd_cacheinfo))
+    telegram_app.add_handler(CommandHandler("diagprivacy", cmd_diagprivacy))
 
     telegram_app.add_handler(CommandHandler("aide", cmd_aide))
     telegram_app.add_handler(CommandHandler("alya", cmd_alya))
