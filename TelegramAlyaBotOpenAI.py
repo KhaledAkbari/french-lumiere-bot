@@ -953,8 +953,8 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
             chain_cache = reconstruct_chain_from_cache(chat_id, replied.message_id, bot_id)
 
             dbg = format_thread_debug(chain_payload, chain_cache, replied, combined, chat_id)
+
             await send_text_private_to_user(update, context, user.id, dbg)
-            await send_notice_fr(update, "✅ Debug envoyé en DM.")
             return
 
         # Public extraction
