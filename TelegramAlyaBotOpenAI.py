@@ -35,8 +35,8 @@ COMMANDS (use as a reply to a message)
 /repaud   : natural helpful reply (no grammar correction) -> voice note (OGG/OPUS)
 /cortex   : mild correction + positive tone + feedback -> text
 /coraud   : mild correction + positive tone + feedback -> voice note
-/reftex   : reformulate (more fluid) + 2–3 vocab suggestions -> text
-/refaud   : reformulate (more fluid) + 2–3 vocab suggestions -> voice note
+/reftex   : reformulate (more fluid) + concise vocab (2 items) -> text
+/refaud   : reformulate (more fluid) + concise vocab (2 items) -> voice note
 /sumtex   : summarize target message -> text
 /sumaud   : summarize target message -> voice note
 /exttex   : transcribe target audio/voice -> text
@@ -50,6 +50,7 @@ Important:
 - Context is NOT stored. It is collected on-the-fly ONLY when /con* is used.
 - If there is no reply chain, /con* falls back to normal single-message behavior.
 - Thread context input is capped to ~THREAD_MAX_INPUT_TOKENS (approximation).
+- For /con*, the thread includes ALL participants in the reply chain (no filtering).
 
 ADMIN-ONLY PRIVATE COMMANDS (HIDDEN)
 -----------------------------------
@@ -62,6 +63,7 @@ BEHAVIOR / COST
 - Output is capped to MAX_OUTPUT_TOKENS (200).
 - Alya does NOT correct grammar unless /cortex or /coraud is used.
 - For corrections: start with one positive sentence, then mild corrections, then constructive feedback.
+- Always respond in French.
 
 AUDIO LIMITS (protect costs)
 ---------------------------
@@ -71,7 +73,7 @@ Based on the replied (target) audio duration:
 
 TTS
 ---
-Defaults: tts-1 + nova (requested).
+Defaults: tts-1 + nova.
 
 RENDER ENVIRONMENT VARIABLES
 ----------------------------
@@ -126,11 +128,14 @@ COOLDOWN_APPLIES_TO = {
 }
 
 # Thread context budget (approx). We don't tokenize here; we enforce via char caps.
-THREAD_MAX_INPUT_TOKENS = 300
-# Heuristic: ~4 chars per token → 300 tokens ≈ 1200 chars total context.
+THREAD_MAX_INPUT_TOKENS = 400
+# Heuristic: ~4 chars/token → 300 tokens ≈ 1200 chars total context.
 THREAD_MAX_CONTEXT_CHARS = int(os.getenv("THREAD_MAX_CONTEXT_CHARS", "1200"))
-THREAD_MAX_HOPS = int(os.getenv("THREAD_MAX_HOPS", "8"))
-THREAD_MAX_CHARS_EACH = int(os.getenv("THREAD_MAX_CHARS_EACH", "500"))
+THREAD_MAX_HOPS = int(os.getenv("THREAD_MAX_HOPS", "10"))
+THREAD_MAX_CHARS_EACH = int(os.getenv("THREAD_MAX_CHARS_EACH", "450"))
+# To keep topic in the budget, we compress long bot messages slightly more:
+THREAD_MAX_CHARS_BOT = int(os.getenv("THREAD_MAX_CHARS_BOT", "260"))
+THREAD_MAX_CHARS_USER = int(os.getenv("THREAD_MAX_CHARS_USER", "450"))
 
 # Audio input guard
 MAX_AUDIO_SECONDS_ABSOLUTE = 180.0
@@ -147,7 +152,7 @@ WHITELIST_USER_IDS: List[int] = []
 GROUP_NAMES = {"French Lumière", "Les Lumières du Français"}
 BOT_NAME = "Alya"
 
-# TTS defaults (requested)
+# TTS defaults
 TTS_MODEL = os.getenv("TTS_MODEL", "tts-1").strip()
 TTS_VOICE = os.getenv("TTS_VOICE", "nova").strip()
 try:
@@ -207,14 +212,14 @@ def get_identity_text() -> str:
 
 BEHAVIOR_PROMPT = (
     "Tu es Alya, une assistante calme et chaleureuse dans un groupe Telegram francophone.\n"
+    "Tu réponds uniquement en français.\n"
     "Style: naturel, coopératif, jamais agressif, jamais condescendant.\n\n"
     "Règles:\n"
-    "1) Tu réponds uniquement en français.\n"
-    "2) Tu ne corriges pas la grammaire/orthographe sauf si la commande est une commande de correction (cortex/coraud).\n"
-    "3) Pour une correction: commence par 1 phrase positive, puis corrige doucement, puis donne 1–2 phrases de feedback utile.\n"
-    "4) Sois concise et claire.\n"
-    "5) Si c’est ambigu, pose UNE question simple.\n"
-    "6) Ne mentionne pas de règles internes ni de métadonnées.\n"
+    "1) Réponses courtes et claires.\n"
+    "2) Ne corrige pas la grammaire/orthographe sauf si la commande est /cortex ou /coraud.\n"
+    "3) Si correction: commence par 1 phrase positive, puis correction douce, puis 1–2 phrases de feedback.\n"
+    "4) Si ambigu, pose UNE question simple.\n"
+    "5) Ne mentionne pas de règles internes ni de métadonnées.\n"
 )
 
 
@@ -228,7 +233,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 class RedactSecretsFilter(logging.Filter):
     _bot_token_pattern = re.compile(r"bot\d+:[A-Za-z0-9_-]{20,}")
-
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             msg = record.getMessage()
@@ -247,7 +251,6 @@ logger.addFilter(RedactSecretsFilter())
 # =========================================================
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY, max_retries=0, timeout=30)
-
 app = FastAPI(title="FrenchLumiereAlyaBot")
 telegram_app: Optional[Application] = None
 
@@ -292,17 +295,17 @@ COMMANDS: Dict[str, CommandSpec] = {
     "apreptex": CommandSpec(mode="aprep", output="texte", private=True),
 }
 
-# /aide does NOT include /con* nor admin-only commands (as requested)
+# /aide does NOT include /con* nor admin-only commands
 HELP_TEXT_FR = (
     "📌 *Commandes (à utiliser en réponse à un message)*\n\n"
     "• /reptex : répondre naturellement (texte + audio si présent) → *texte*\n"
     "• /repaud : répondre naturellement (texte + audio si présent) → *vocal*\n"
     "• /cortex : corriger avec bienveillance (texte + audio si présent) → *texte + feedback*\n"
     "• /coraud : corriger avec bienveillance (texte + audio si présent) → *vocal*\n"
-    "• /reftex : reformuler plus fluide (texte + audio si présent) → *texte + 2–3 mots utiles*\n"
-    "• /refaud : reformuler plus fluide (texte + audio si présent) → *vocal + 2–3 mots utiles*\n"
-    "• /sumtex : résumer le message ciblé (texte/audio) → *texte*\n"
-    "• /sumaud : résumer le message ciblé (texte/audio) → *vocal*\n"
+    "• /reftex : reformuler plus fluide → *texte + 2 mots*\n"
+    "• /refaud : reformuler plus fluide → *vocal + 2 mots*\n"
+    "• /sumtex : résumer (texte/audio) → *texte*\n"
+    "• /sumaud : résumer (texte/audio) → *vocal*\n"
     "• /exttex : audio → *transcription texte* (nécessite un audio)\n"
     "• /alya : qui suis-je ? (identité du bot)\n\n"
     "📩 *Versions privées (en DM à l’auteur original)*\n"
@@ -359,16 +362,10 @@ async def user_can_use_commands(update: Update, context: ContextTypes.DEFAULT_TY
 
 def get_replied_message(update: Update) -> Optional[Message]:
     msg = update.effective_message
-    if not msg:
-        return None
-    return msg.reply_to_message
+    return msg.reply_to_message if msg else None
 
 def extract_text_from_message(msg: Message) -> str:
-    if msg.text:
-        return msg.text.strip()
-    if msg.caption:
-        return msg.caption.strip()
-    return ""
+    return (msg.text or msg.caption or "").strip()
 
 def audio_file_id(msg: Message) -> Optional[str]:
     if msg.voice:
@@ -399,29 +396,40 @@ def infer_audio_format_hint(msg: Message) -> Optional[str]:
 
 
 # =========================================================
-# Thread-aware context: collect reply chain ON THE FLY (no storage)
+# Thread-aware context (stronger /con*): reply-chain collector (ALL participants)
 # =========================================================
 
 def _truncate(s: str, n: int) -> str:
     s = (s or "").strip()
     return (s[:n].rstrip() + "…") if len(s) > n else s
 
-def collect_reply_chain_context(
-    start_msg: Message,
+def _speaker_prefix(msg: Message, bot_user_id: int) -> str:
+    u = msg.from_user
+    if not u:
+        return ""
+    if u.id == bot_user_id:
+        return "Alya: "
+    # Use first_name only to reduce tokens; fallback to "Membre"
+    name = (u.first_name or "Membre").strip()
+    return f"{name}: "
+
+def collect_reply_chain_context_all(
+    start_msg: Optional[Message],
     bot_user_id: int,
     max_hops: int = THREAD_MAX_HOPS,
-    max_chars_each: int = THREAD_MAX_CHARS_EACH,
     max_total_chars: int = THREAD_MAX_CONTEXT_CHARS,
 ) -> List[Dict[str, str]]:
     """
-    Collect context from reply_to_message chain only.
-    - Includes only text/caption from user + Alya messages.
-    - Skips older audio transcription (avoids extra Whisper cost).
-    - Returns turns in chronological order.
+    Collect reply_to_message chain context (no storage).
+    Includes ALL participants in the chain.
+    - role='assistant' for Alya messages
+    - role='user' for everyone else
+    Adds a short speaker prefix to preserve who said what.
+    Uses text/caption only (does not transcribe older audios).
     """
     turns: List[Dict[str, str]] = []
     total = 0
-    cur: Optional[Message] = start_msg
+    cur = start_msg
 
     for _ in range(max_hops):
         if not cur:
@@ -432,10 +440,17 @@ def collect_reply_chain_context(
 
         txt = (cur.text or cur.caption or "").strip()
         if txt:
-            txt = _truncate(txt, max_chars_each)
+            txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
+            cap = THREAD_MAX_CHARS_BOT if u.id == bot_user_id else THREAD_MAX_CHARS_USER
+            txt = _truncate(txt, cap)
+
+            pref = _speaker_prefix(cur, bot_user_id)
+            content = (pref + txt).strip()
+
             role = "assistant" if u.id == bot_user_id else "user"
-            turns.append({"role": role, "content": txt})
-            total += len(txt)
+            turns.append({"role": role, "content": content})
+
+            total += len(content)
             if total >= max_total_chars:
                 break
 
@@ -471,15 +486,7 @@ async def download_file_bytes(context: ContextTypes.DEFAULT_TYPE, file_id: str) 
 
 def convert_to_wav(raw_bytes: bytes, format_hint: Optional[str] = None) -> bytes:
     buf = io.BytesIO(raw_bytes)
-    if format_hint == "ogg":
-        buf.name = "audio.ogg"
-    elif format_hint == "mp3":
-        buf.name = "audio.mp3"
-    elif format_hint == "m4a":
-        buf.name = "audio.m4a"
-    else:
-        buf.name = "audio.bin"
-
+    buf.name = f"audio.{format_hint or 'bin'}"
     audio = AudioSegment.from_file(buf, format=format_hint) if format_hint else AudioSegment.from_file(buf)
     out = io.BytesIO()
     audio.export(out, format="wav")
@@ -508,7 +515,6 @@ def tts_to_ogg_opus_bytes(text_fr: str) -> bytes:
     ) as resp:
         for chunk in resp.iter_bytes():
             mp3_bytes += chunk
-
     audio = AudioSegment.from_file(io.BytesIO(mp3_bytes), format="mp3")
     out = io.BytesIO()
     out.name = "reply.ogg"
@@ -557,12 +563,10 @@ async def send_voice_result_to_chat(update: Update, context: ContextTypes.DEFAUL
     text_fr = (text_fr or "").strip() or "Désolé, je n’ai pas pu générer de réponse."
     if len(text_fr) > cap:
         text_fr = text_fr[:cap].rstrip() + "…"
-
     ogg_bytes = await run_blocking(tts_to_ogg_opus_bytes, text_fr)
     voice_file = io.BytesIO(ogg_bytes)
     voice_file.name = "reponse.ogg"
     voice_file.seek(0)
-
     await context.bot.send_voice(
         chat_id=update.effective_chat.id,
         voice=voice_file,
@@ -587,7 +591,6 @@ async def build_input_bundle(context: ContextTypes.DEFAULT_TYPE, msg: Message) -
     fid = audio_file_id(msg)
     if not fid:
         return text, None
-
     fmt = infer_audio_format_hint(msg)
     raw = await download_file_bytes(context, fid)
     wav = await run_blocking(convert_to_wav, raw, fmt)
@@ -649,53 +652,49 @@ def messages_for_single(user_prompt: str) -> List[Dict[str, str]]:
 
 def prompt_rep(combined_input: str) -> str:
     add_suggestion = (random.random() < 0.30)
-    suggestion_line = (
-        "\n\nOptionnel: ajoute UNE petite suggestion douce (1 phrase) pour améliorer la clarté."
-        if add_suggestion else ""
-    )
+    suggestion_line = ("\n\nOptionnel: une suggestion douce (1 phrase)." if add_suggestion else "")
     return (
         "Réponds naturellement au message ci-dessous, en français. "
         "Sois amical(e), coopératif(ve), simple et clair. "
-        "Ne corrige pas la grammaire/orthographe (sauf si on te le demande explicitement)."
+        "Ne corrige pas la grammaire/orthographe."
         f"{suggestion_line}\n\n{combined_input}"
     )
 
 def prompt_cor(combined_input: str) -> str:
     return (
-        "Tu vas corriger le contenu ci-dessous en français. "
-        "IMPORTANT: commence par 1 phrase positive (compliment sincère). "
-        "Ensuite, donne la version corrigée (sans changer le style). "
-        "Enfin, ajoute 1–2 phrases de feedback bienveillant (si c'est un audio, tu peux commenter prononciation/rythme). "
-        "Reste doux/douce et encourageant(e).\n\n"
+        "Corrige le contenu ci-dessous en français. "
+        "Format: 1 phrase positive, puis correction douce, puis 1–2 phrases de feedback. "
+        "Reste bref/breve.\n\n"
         f"{combined_input}"
     )
 
 def prompt_ref(combined_input: str) -> str:
+    # concise vocab requirement: exactly 2 items, very short defs
     return (
-        "Reformule le message ci-dessous en français pour le rendre plus fluide et naturel, sans changer le sens. "
-        "Après la reformulation, propose 2 à 3 mots/expressions utiles (vocabulaire) adaptés au contexte, avec une brève définition en français. "
-        "Sois bref/breve.\n\n"
+        "Reformule le message ci-dessous en français pour le rendre plus fluide, sans changer le sens. "
+        "Puis donne exactement 2 mots/expressions utiles avec une mini définition (très courte). "
+        "Sois très concise.\n\n"
         f"{combined_input}"
     )
 
 def prompt_sum(combined_input: str) -> str:
     return (
-        "Résume le contenu ci-dessous en français en 2 à 4 phrases maximum. "
-        "Sois clair et concis. N’invente rien.\n\n"
+        "Résume le contenu ci-dessous en français en 2 à 3 phrases maximum. "
+        "Sois clair et concis.\n\n"
         f"{combined_input}"
     )
 
 def prompt_con() -> str:
     return (
         "En te basant UNIQUEMENT sur le fil (reply chain) ci-dessus, réponds au dernier message de façon utile et concise. "
-        "Si une info manque, pose UNE question courte. "
+        "Toujours en français. Si une info manque, pose UNE question courte. "
         "Ne corrige pas la grammaire/orthographe sauf si on te le demande explicitement."
     )
 
 def prompt_rap_analyze(combined_input: str) -> str:
     return (
-        "Analyse ce texte/rap (ou transcription audio). "
-        "Réponds brièvement en français avec: 1) ce qui marche bien, 2) un point d’amélioration concret, 3) une suggestion courte.\n\n"
+        "Analyse ce texte/rap (ou transcription). "
+        "Réponds brièvement en français: 1) point fort, 2) amélioration concrète, 3) suggestion courte.\n\n"
         f"{combined_input}"
     )
 
@@ -788,9 +787,6 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
                 return
 
             if spec.mode == "aprep":
-                if not combined:
-                    await send_notice_fr(update, "⚠️ Le message ciblé ne contient ni texte ni audio exploitable.")
-                    return
                 msgs = messages_for_single(prompt_rap_analyze(combined))
                 result = await run_blocking(openai_chat, msgs)
                 await send_text_private_to_user(update, context, user.id, result)
@@ -808,23 +804,22 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
             await send_notice_fr(update, "⚠️ Le message ciblé ne contient ni texte ni audio exploitable.")
             return
 
-        # Thread-aware commands: collect reply chain ONLY when /con* used
+        # Stronger /con*: include ALL participants in the reply-chain (no filtering)
         if spec.mode == "con":
             bot_id = context.bot.id
-            chain_turns = collect_reply_chain_context(replied, bot_id)
 
-            # If no chain context, fallback to normal single-message reply behavior
-            if not chain_turns:
-                msgs = messages_for_single(prompt_rep(combined))
-                result = await run_blocking(openai_chat, msgs)
-            else:
-                # Add current combined content as the last user turn
-                chain_turns.append({"role": "user", "content": _truncate(combined, THREAD_MAX_CHARS_EACH)})
+            # Collect chain from parent to avoid duplicating current message
+            parent = replied.reply_to_message
+            chain_turns = collect_reply_chain_context_all(parent, bot_id)
 
-                msgs = [{"role": "system", "content": BEHAVIOR_PROMPT}] + chain_turns + [
-                    {"role": "user", "content": prompt_con()}
-                ]
-                result = await run_blocking(openai_chat, msgs)
+            # Append current message once (with speaker prefix)
+            current_pref = _speaker_prefix(replied, bot_id)
+            chain_turns.append({"role": "user", "content": _truncate(current_pref + combined, THREAD_MAX_CHARS_EACH)})
+
+            msgs = [{"role": "system", "content": BEHAVIOR_PROMPT}] + chain_turns + [
+                {"role": "user", "content": prompt_con()}
+            ]
+            result = await run_blocking(openai_chat, msgs)
 
             if spec.output == "audio":
                 await send_voice_result_to_chat(update, context, replied, result, caller_is_admin)
@@ -832,7 +827,7 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
                 await send_text_result_to_chat(update, context, replied, result)
             return
 
-        # Normal single-message commands (rep/cor/ref/sum)
+        # Normal single-message commands
         if spec.mode == "rep":
             user_prompt = prompt_rep(combined)
         elif spec.mode == "cor":
@@ -915,9 +910,8 @@ async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: Optional[str] = Header(default=None),
 ):
-    if WEBHOOK_SECRET_TOKEN:
-        if x_telegram_bot_api_secret_token != WEBHOOK_SECRET_TOKEN:
-            raise HTTPException(status_code=403, detail="Forbidden")
+    if WEBHOOK_SECRET_TOKEN and x_telegram_bot_api_secret_token != WEBHOOK_SECRET_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
     if telegram_app is None:
         raise HTTPException(status_code=503, detail="Bot not ready")
@@ -927,13 +921,8 @@ async def telegram_webhook(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    try:
-        update = Update.de_json(data, telegram_app.bot)
-        await telegram_app.process_update(update)
-    except Exception:
-        logger.exception("Failed to process update (no content logged).")
-        raise HTTPException(status_code=500, detail="Failed to process update")
-
+    update = Update.de_json(data, telegram_app.bot)
+    await telegram_app.process_update(update)
     return {"ok": True}
 
 
