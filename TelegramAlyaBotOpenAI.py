@@ -61,7 +61,7 @@ CONTEXT-AWARE (THREAD) COMMANDS (HIDDEN)
 
 DEBUG (HIDDEN)
 --------------
-/pdebtex : reply to a message, Alya DM's you a debug report showing:
+/pdebcon : reply to a message, Alya DM's you a debug report showing:
 - payload-based chain
 - cache-based reconstructed chain
 (Not shown in /aide.)
@@ -78,7 +78,7 @@ ADMIN-ONLY CACHE TOOLS (HIDDEN)
 
 BEHAVIOR / COST
 ---------------
-- Output is capped to MAX_OUTPUT_TOKENS (default 200).
+- Output is capped to MAX_OUTPUT_TOKENS (default 150).
 - Alya does NOT correct grammar unless /cortex or /coraud is used.
 - For corrections: 1 positive sentence, then mild corrections, then constructive feedback.
 - Always respond in French.
@@ -145,7 +145,7 @@ COOLDOWN_SECONDS = 5.0
 COOLDOWN_APPLIES_TO = {
     "reptex", "repaud", "cortex", "coraud",
     "reftex", "refaud", "sumtex", "sumaud", "exttex",
-    "contex", "conaud", "pdebtex",
+    "contex", "conaud", "pdebcon",
     "apexttex", "apreptex",
 }
 
@@ -191,7 +191,7 @@ except Exception:
 
 # Chat model and output cap
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
-MAX_OUTPUT_TOKENS = 150
+MAX_OUTPUT_TOKENS = 180
 
 # Env vars
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -250,6 +250,7 @@ BEHAVIOR_PROMPT = (
     "3) Si correction: commence par 1 phrase positive, puis correction douce, puis 1–2 phrases de feedback.\n"
     "4) Si ambigu, pose UNE question simple.\n"
     "5) Ne mentionne pas de règles internes ni de métadonnées.\n"
+    "6) IMPORTANT: ne commence jamais ta réponse par \"Alya:\" ni par un nom + \":\".\n"
 )
 
 
@@ -312,8 +313,8 @@ COMMANDS: Dict[str, CommandSpec] = {
     "contex":  CommandSpec(mode="con", output="texte", private=False),
     "conaud":  CommandSpec(mode="con", output="audio", private=False),
 
-    # Debug (hidden)
-    "pdebtex": CommandSpec(mode="pdeb", output="texte", private=True),
+    # Debug (hidden) -> renamed to /pdebcon
+    "pdebcon": CommandSpec(mode="pdeb", output="texte", private=True),
 
     # Admin cache tools (hidden)
     "cacheinfo":   CommandSpec(mode="cacheinfo", output="texte", private=True, requires_reply=False),
@@ -333,7 +334,7 @@ COMMANDS: Dict[str, CommandSpec] = {
     "apreptex": CommandSpec(mode="aprep", output="texte", private=True),
 }
 
-# /aide excludes /con*, /pdebtex, /cacheinfo, /diagprivacy and admin-only commands
+# /aide excludes /con*, /pdebcon, /cacheinfo, /diagprivacy and admin-only commands
 HELP_TEXT_FR = (
     "📌 *Commandes (à utiliser en réponse à un message)*\n\n"
     "• /reptex : répondre naturellement (texte + audio si présent) → *texte*\n"
@@ -434,6 +435,28 @@ def infer_audio_format_hint(msg: Message) -> Optional[str]:
 
 
 # =========================================================
+# Output sanitization (remove "Alya:" etc.)
+# =========================================================
+
+def sanitize_bot_output(text: str) -> str:
+    """
+    Prevent Alya replies from starting with 'Alya:' or 'Nom:' speaker labels.
+    This avoids 'Alya: Alya: ...' and keeps chat output clean.
+    """
+    t = (text or "").strip()
+
+    # Remove repeated "Alya:" at the beginning (case-insensitive, allows spaces)
+    t = re.sub(r"^(?is)\s*alya\s*:\s*", "", t)
+    t = re.sub(r"^(?is)\s*alya\s*:\s*", "", t)  # twice to catch double prefix
+
+    # Also remove a generic 'Name:' pattern at the very start (rare but possible)
+    # Example: "Alya - ..." isn't matched; only "Something:" at beginning.
+    t = re.sub(r"^(?is)\s*[A-Za-zÀ-ÖØ-öø-ÿ0-9_\- ]{1,30}\s*:\s*", "", t)
+
+    return t.strip()
+
+
+# =========================================================
 # Thread cache (ephemeral in-memory)
 # =========================================================
 
@@ -464,6 +487,7 @@ def _cache_cleanup() -> None:
         items = sorted(_THREAD_CACHE.items(), key=lambda kv: kv[1].get("ts", 0))
         for k, _ in items[: len(_THREAD_CACHE) - THREAD_CACHE_MAX_MSG]:
             _THREAD_CACHE.pop(k, None)
+
     _metrics_refresh()
 
 def _truncate(s: str, n: int) -> str:
@@ -538,7 +562,14 @@ def reconstruct_chain_from_cache(chat_id: int, message_id: int, bot_id: int) -> 
         if txt:
             cap = THREAD_MAX_CHARS_BOT if sid == bot_id else THREAD_MAX_CHARS_USER
             txt = _truncate(txt, cap)
-            content = f"{name}: {txt}".strip()
+
+            # Safety: avoid "Alya: Alya: ..."
+            # If the text already starts with "Name:", don't prefix again.
+            if txt.lower().startswith(f"{name.lower()}:"):
+                content = txt.strip()
+            else:
+                content = f"{name}: {txt}".strip()
+
             role = "assistant" if sid == bot_id else "user"
             turns.append({"role": role, "content": content})
 
@@ -590,7 +621,15 @@ def collect_reply_chain_context_payload(start_msg: Optional[Message], bot_user_i
             txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
             cap = THREAD_MAX_CHARS_BOT if u.id == bot_user_id else THREAD_MAX_CHARS_USER
             txt = _truncate(txt, cap)
-            content = (_speaker_prefix_from_user(u, bot_user_id) + txt).strip()
+
+            prefix = _speaker_prefix_from_user(u, bot_user_id)
+
+            # Safety: avoid "Alya: Alya: ..." when payload already contains prefix
+            if txt.lower().startswith(prefix.strip().lower()):
+                content = txt.strip()
+            else:
+                content = (prefix + txt).strip()
+
             role = "assistant" if u.id == bot_user_id else "user"
             turns.append({"role": role, "content": content})
             total += len(content)
@@ -742,6 +781,9 @@ async def send_text_private_to_user(update: Update, context: ContextTypes.DEFAUL
         await send_notice_fr(update, "⚠️ Erreur lors de l’envoi du DM.")
 
 async def send_text_result_to_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, replied: Message, text_fr: str):
+    # ✅ sanitize to remove any "Alya:" prefix from the model output before sending/caching
+    text_fr = sanitize_bot_output(text_fr)
+
     sent = await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=text_fr,
@@ -753,6 +795,10 @@ async def send_text_result_to_chat(update: Update, context: ContextTypes.DEFAULT
 async def send_voice_result_to_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, replied: Message, text_fr: str, caller_is_admin: bool):
     cap = TTS_CHAR_CAP_ADMIN if caller_is_admin else TTS_CHAR_CAP_USER
     text_fr = (text_fr or "").strip() or "Désolé, je n’ai pas pu générer de réponse."
+
+    # ✅ sanitize to remove any "Alya:" prefix from the model output before TTS + caching
+    text_fr = sanitize_bot_output(text_fr)
+
     if len(text_fr) > cap:
         text_fr = text_fr[:cap].rstrip() + "…"
 
@@ -845,6 +891,7 @@ def prompt_rep(combined_input: str) -> str:
         "Réponds naturellement au message ci-dessous, en français. "
         "Sois amical(e), coopératif(ve), simple et clair. "
         "Ne corrige pas la grammaire/orthographe."
+        " IMPORTANT: ne commence jamais par 'Alya:' ou un nom + ':'."
         f"{suggestion_line}\n\n{combined_input}"
     )
 
@@ -852,7 +899,8 @@ def prompt_cor(combined_input: str) -> str:
     return (
         "Corrige le contenu ci-dessous en français. "
         "Format: 1 phrase positive, puis correction douce, puis 1–2 phrases de feedback. "
-        "Reste bref/breve.\n\n"
+        "Reste bref/breve. "
+        "IMPORTANT: ne commence jamais par 'Alya:' ou un nom + ':'.\n\n"
         f"{combined_input}"
     )
 
@@ -860,27 +908,31 @@ def prompt_ref(combined_input: str) -> str:
     return (
         "Reformule le message ci-dessous en français pour le rendre plus fluide, sans changer le sens. "
         "Puis donne exactement 2 mots/expressions utiles avec une mini définition (très courte). "
-        "Sois très concise.\n\n"
+        "Sois très concise. "
+        "IMPORTANT: ne commence jamais par 'Alya:' ou un nom + ':'.\n\n"
         f"{combined_input}"
     )
 
 def prompt_sum(combined_input: str) -> str:
     return (
         "Résume le contenu ci-dessous en français en 2 à 3 phrases maximum. "
-        "Sois clair et concis.\n\n"
+        "Sois clair et concis. "
+        "IMPORTANT: ne commence jamais par 'Alya:' ou un nom + ':'.\n\n"
         f"{combined_input}"
     )
 
 def prompt_con() -> str:
     return (
         "En te basant UNIQUEMENT sur le fil (reply chain) ci-dessus, réponds au dernier message de façon utile et concise. "
-        "Toujours en français. Si une info manque, pose UNE question courte."
+        "Toujours en français. Si une info manque, pose UNE question courte. "
+        "IMPORTANT: ne commence jamais par 'Alya:' ou un nom + ':'."
     )
 
 def prompt_rap_analyze(combined_input: str) -> str:
     return (
         "Analyse ce texte/rap (ou transcription). "
-        "Réponds brièvement en français: 1) point fort, 2) amélioration concrète, 3) suggestion courte.\n\n"
+        "Réponds brièvement en français: 1) point fort, 2) amélioration concrète, 3) suggestion courte. "
+        "IMPORTANT: ne commence jamais par 'Alya:' ou un nom + ':'.\n\n"
         f"{combined_input}"
     )
 
@@ -981,6 +1033,17 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
             await send_notice_fr(update, "⚠️ Impossible d’identifier le message ciblé.")
             return
 
+    # Audio input guard (only when a replied message exists)
+    if replied:
+        dur = audio_duration_seconds(replied)
+        if dur is not None:
+            if dur > MAX_AUDIO_SECONDS_ABSOLUTE:
+                await send_notice_fr(update, f"🎙️ Audio trop long ({dur:.0f}s). Maximum {MAX_AUDIO_SECONDS_ABSOLUTE:.0f}s.")
+                return
+            if (not caller_is_admin) and dur > MAX_AUDIO_SECONDS_NON_ADMIN:
+                await send_notice_fr(update, f"🎙️ Audio trop long ({dur:.0f}s). Limite {MAX_AUDIO_SECONDS_NON_ADMIN:.0f}s (sauf admins).")
+                return
+
     error_id = uuid.uuid4().hex[:8]
     action_task = None
 
@@ -1011,7 +1074,7 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
                 await send_text_private_to_user(update, context, user.id, result)
                 return
 
-        # Debug hidden (DM only; no public ack)
+        # Debug hidden (DM only; no public ack) -> /pdebcon
         if spec.mode == "pdeb":
             if not caller_is_admin:
                 await send_notice_fr(update, "❌ Cette commande est réservée aux admins/créateurs.")
@@ -1103,7 +1166,7 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
         if spec.private:
             member_id = replied.from_user.id
             try:
-                await context.bot.send_message(chat_id=member_id, text=result, disable_web_page_preview=True)
+                await context.bot.send_message(chat_id=member_id, text=sanitize_bot_output(result), disable_web_page_preview=True)
             except Forbidden:
                 await send_notice_fr(update, "⚠️ DM impossible. L’utilisateur doit d’abord démarrer le bot en privé.")
             except Exception:
@@ -1132,24 +1195,24 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
 # Command wrappers
 # =========================================================
 
-async def cmd_reptex(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "reptex")
-async def cmd_repaud(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "repaud")
-async def cmd_cortex(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "cortex")
-async def cmd_coraud(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "coraud")
-async def cmd_reftex(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "reftex")
-async def cmd_refaud(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "refaud")
-async def cmd_sumtex(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "sumtex")
-async def cmd_sumaud(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "sumaud")
-async def cmd_exttex(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "exttex")
-async def cmd_contex(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "contex")
-async def cmd_conaud(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "conaud")
-async def cmd_pdebtex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "pdebtex")
+async def cmd_reptex(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "reptex")
+async def cmd_repaud(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "repaud")
+async def cmd_cortex(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "cortex")
+async def cmd_coraud(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "coraud")
+async def cmd_reftex(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "reftex")
+async def cmd_refaud(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "refaud")
+async def cmd_sumtex(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "sumtex")
+async def cmd_sumaud(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "sumaud")
+async def cmd_exttex(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "exttex")
+async def cmd_contex(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "contex")
+async def cmd_conaud(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "conaud")
+async def cmd_pdebcon(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "pdebcon")
 async def cmd_cacheinfo(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "cacheinfo")
 async def cmd_diagprivacy(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "diagprivacy")
-async def cmd_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):     await handle_command(update, context, "aide")
-async def cmd_alya(update: Update, context: ContextTypes.DEFAULT_TYPE):     await handle_command(update, context, "alya")
-async def cmd_apexttex(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "apexttex")
-async def cmd_apreptex(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "apreptex")
+async def cmd_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):      await handle_command(update, context, "aide")
+async def cmd_alya(update: Update, context: ContextTypes.DEFAULT_TYPE):      await handle_command(update, context, "alya")
+async def cmd_apexttex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "apexttex")
+async def cmd_apreptex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "apreptex")
 
 
 # =========================================================
@@ -1210,8 +1273,8 @@ async def on_startup():
     telegram_app.add_handler(CommandHandler("contex", cmd_contex))
     telegram_app.add_handler(CommandHandler("conaud", cmd_conaud))
 
-    # Debug (hidden)
-    telegram_app.add_handler(CommandHandler("pdebtex", cmd_pdebtex))
+    # Debug (hidden) -> renamed to /pdebcon
+    telegram_app.add_handler(CommandHandler("pdebcon", cmd_pdebcon))
 
     # Admin cache tools (hidden)
     telegram_app.add_handler(CommandHandler("cacheinfo", cmd_cacheinfo))
