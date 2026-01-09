@@ -191,7 +191,7 @@ except Exception:
 
 # Chat model and output cap
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
-MAX_OUTPUT_TOKENS = 180
+MAX_OUTPUT_TOKENS = 150
 
 # Env vars
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -313,7 +313,7 @@ COMMANDS: Dict[str, CommandSpec] = {
     "contex":  CommandSpec(mode="con", output="texte", private=False),
     "conaud":  CommandSpec(mode="con", output="audio", private=False),
 
-    # Debug (hidden) -> renamed to /pdebcon
+    # Debug (hidden) -> renamed
     "pdebcon": CommandSpec(mode="pdeb", output="texte", private=True),
 
     # Admin cache tools (hidden)
@@ -435,23 +435,29 @@ def infer_audio_format_hint(msg: Message) -> Optional[str]:
 
 
 # =========================================================
-# Output sanitization (remove "Alya:" etc.)
+# Output sanitization (FIXED for Python 3.12)
 # =========================================================
 
 def sanitize_bot_output(text: str) -> str:
     """
-    Prevent Alya replies from starting with 'Alya:' or 'Nom:' speaker labels.
-    This avoids 'Alya: Alya: ...' and keeps chat output clean.
+    Empêche les réponses d’Alya de commencer par 'Alya:' ou 'Nom:'.
+    Évite 'Alya: Alya: ...' et garde la sortie propre.
+
+    (Fix Python 3.12: use flags= instead of inline (?is) after ^)
     """
     t = (text or "").strip()
 
-    # Remove repeated "Alya:" at the beginning (case-insensitive, allows spaces)
-    t = re.sub(r"^(?is)\s*alya\s*:\s*", "", t)
-    t = re.sub(r"^(?is)\s*alya\s*:\s*", "", t)  # twice to catch double prefix
+    # Remove 1 or more "Alya:" prefixes at the beginning (case-insensitive)
+    t = re.sub(r"^\s*alya\s*:\s*", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"^\s*alya\s*:\s*", "", t, flags=re.IGNORECASE)  # in case it's repeated
 
-    # Also remove a generic 'Name:' pattern at the very start (rare but possible)
-    # Example: "Alya - ..." isn't matched; only "Something:" at beginning.
-    t = re.sub(r"^(?is)\s*[A-Za-zÀ-ÖØ-öø-ÿ0-9_\- ]{1,30}\s*:\s*", "", t)
+    # Remove generic "Name:" prefix at the very start (rare but possible)
+    t = re.sub(
+        r"^\s*[A-Za-zÀ-ÖØ-öø-ÿ0-9_\- ]{1,30}\s*:\s*",
+        "",
+        t,
+        flags=re.IGNORECASE,
+    )
 
     return t.strip()
 
@@ -564,7 +570,6 @@ def reconstruct_chain_from_cache(chat_id: int, message_id: int, bot_id: int) -> 
             txt = _truncate(txt, cap)
 
             # Safety: avoid "Alya: Alya: ..."
-            # If the text already starts with "Name:", don't prefix again.
             if txt.lower().startswith(f"{name.lower()}:"):
                 content = txt.strip()
             else:
@@ -624,7 +629,7 @@ def collect_reply_chain_context_payload(start_msg: Optional[Message], bot_user_i
 
             prefix = _speaker_prefix_from_user(u, bot_user_id)
 
-            # Safety: avoid "Alya: Alya: ..." when payload already contains prefix
+            # Safety: avoid "Alya: Alya: ..."
             if txt.lower().startswith(prefix.strip().lower()):
                 content = txt.strip()
             else:
@@ -781,7 +786,7 @@ async def send_text_private_to_user(update: Update, context: ContextTypes.DEFAUL
         await send_notice_fr(update, "⚠️ Erreur lors de l’envoi du DM.")
 
 async def send_text_result_to_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, replied: Message, text_fr: str):
-    # ✅ sanitize to remove any "Alya:" prefix from the model output before sending/caching
+    # sanitize to prevent "Alya:" prefixes in output
     text_fr = sanitize_bot_output(text_fr)
 
     sent = await context.bot.send_message(
@@ -796,7 +801,7 @@ async def send_voice_result_to_chat(update: Update, context: ContextTypes.DEFAUL
     cap = TTS_CHAR_CAP_ADMIN if caller_is_admin else TTS_CHAR_CAP_USER
     text_fr = (text_fr or "").strip() or "Désolé, je n’ai pas pu générer de réponse."
 
-    # ✅ sanitize to remove any "Alya:" prefix from the model output before TTS + caching
+    # sanitize to prevent "Alya:" prefixes in output
     text_fr = sanitize_bot_output(text_fr)
 
     if len(text_fr) > cap:
@@ -890,8 +895,8 @@ def prompt_rep(combined_input: str) -> str:
     return (
         "Réponds naturellement au message ci-dessous, en français. "
         "Sois amical(e), coopératif(ve), simple et clair. "
-        "Ne corrige pas la grammaire/orthographe."
-        " IMPORTANT: ne commence jamais par 'Alya:' ou un nom + ':'."
+        "Ne corrige pas la grammaire/orthographe. "
+        "IMPORTANT: ne commence jamais par 'Alya:' ou un nom + ':'."
         f"{suggestion_line}\n\n{combined_input}"
     )
 
@@ -1071,7 +1076,7 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
                 return
             if spec.mode == "aprep":
                 result = await run_blocking(openai_chat, messages_for_single(prompt_rap_analyze(combined)))
-                await send_text_private_to_user(update, context, user.id, result)
+                await send_text_private_to_user(update, context, user.id, sanitize_bot_output(result))
                 return
 
         # Debug hidden (DM only; no public ack) -> /pdebcon
@@ -1195,24 +1200,24 @@ async def handle_command(update: Update, context: ContextTypes.DEFAULT_TYPE, cmd
 # Command wrappers
 # =========================================================
 
-async def cmd_reptex(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "reptex")
-async def cmd_repaud(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "repaud")
-async def cmd_cortex(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "cortex")
-async def cmd_coraud(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "coraud")
-async def cmd_reftex(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "reftex")
-async def cmd_refaud(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "refaud")
-async def cmd_sumtex(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "sumtex")
-async def cmd_sumaud(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "sumaud")
-async def cmd_exttex(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "exttex")
-async def cmd_contex(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "contex")
-async def cmd_conaud(update: Update, context: ContextTypes.DEFAULT_TYPE):    await handle_command(update, context, "conaud")
-async def cmd_pdebcon(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "pdebcon")
+async def cmd_reptex(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "reptex")
+async def cmd_repaud(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "repaud")
+async def cmd_cortex(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "cortex")
+async def cmd_coraud(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "coraud")
+async def cmd_reftex(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "reftex")
+async def cmd_refaud(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "refaud")
+async def cmd_sumtex(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "sumtex")
+async def cmd_sumaud(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "sumaud")
+async def cmd_exttex(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "exttex")
+async def cmd_contex(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "contex")
+async def cmd_conaud(update: Update, context: ContextTypes.DEFAULT_TYPE):   await handle_command(update, context, "conaud")
+async def cmd_pdebcon(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "pdebcon")
 async def cmd_cacheinfo(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "cacheinfo")
 async def cmd_diagprivacy(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "diagprivacy")
-async def cmd_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):      await handle_command(update, context, "aide")
-async def cmd_alya(update: Update, context: ContextTypes.DEFAULT_TYPE):      await handle_command(update, context, "alya")
-async def cmd_apexttex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "apexttex")
-async def cmd_apreptex(update: Update, context: ContextTypes.DEFAULT_TYPE):  await handle_command(update, context, "apreptex")
+async def cmd_aide(update: Update, context: ContextTypes.DEFAULT_TYPE):     await handle_command(update, context, "aide")
+async def cmd_alya(update: Update, context: ContextTypes.DEFAULT_TYPE):     await handle_command(update, context, "alya")
+async def cmd_apexttex(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "apexttex")
+async def cmd_apreptex(update: Update, context: ContextTypes.DEFAULT_TYPE): await handle_command(update, context, "apreptex")
 
 
 # =========================================================
@@ -1273,7 +1278,7 @@ async def on_startup():
     telegram_app.add_handler(CommandHandler("contex", cmd_contex))
     telegram_app.add_handler(CommandHandler("conaud", cmd_conaud))
 
-    # Debug (hidden) -> renamed to /pdebcon
+    # Debug (hidden) -> /pdebcon
     telegram_app.add_handler(CommandHandler("pdebcon", cmd_pdebcon))
 
     # Admin cache tools (hidden)
