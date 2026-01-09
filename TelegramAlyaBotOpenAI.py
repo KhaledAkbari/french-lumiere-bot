@@ -191,7 +191,7 @@ except Exception:
 
 # Chat model and output cap
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
-MAX_OUTPUT_TOKENS = 200
+MAX_OUTPUT_TOKENS = 150
 
 # Env vars
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
