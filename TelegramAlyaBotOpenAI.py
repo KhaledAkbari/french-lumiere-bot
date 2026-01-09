@@ -138,7 +138,7 @@ from pydub import AudioSegment
 # =========================================================
 
 # ⏱ Auto-delete command messages after X seconds
-COMMAND_DELETE_DELAY_S = 5.0
+COMMAND_DELETE_DELAY_S = 0.1
 
 # ⏳ Per-user cooldown (anti-spam / cost control) — NOT shown in /aide
 COOLDOWN_SECONDS = 5.0
